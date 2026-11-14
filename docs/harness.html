@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — The In-Browser Agent Harness</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.2rem; overflow-x: auto; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — The In-Browser Agent Harness</h1>
+  <p class="lead">Calling a model is the easy part. Keeping a multi-turn,
+  multi-tool agent coherent inside a browser tab — across file edits, user
+  interruptions, approvals, and delegated subagents — is the job of the
+  in-browser harness in <code>src/kernel/</code>.</p>
+
+  <h2>Four-layer context assembly</h2>
+  <p>Before every inference round, <code>ContextBuilder.buildMessages</code>
+  reconstructs the conversation from the append-only journal and the live OPFS
+  file tree rather than mutating an in-memory message array:</p>
+  <figure>
+    <svg viewBox="0 0 880 280" role="img" aria-label="Four-layer ContextBuilder pipeline: system workspace header and specialist capsules, hot/cold run window folding, OPFS sha256 drift annotations, and character budget with interrupted tool pairing">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="75" width="185" height="125" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="112" y="103" text-anchor="middle" class="boxtitle">1. System header</text>
+      <text x="112" y="126" text-anchor="middle" class="small">workspace folders</text>
+      <text x="112" y="144" text-anchor="middle" class="small">window.veles contract</text>
+      <text x="112" y="162" text-anchor="middle" class="small">OPFS tree [sha256:8-hex]</text>
+      <text x="112" y="180" text-anchor="middle" class="small">+ ≤ 2 specialist capsules</text>
+
+      <rect x="240" y="75" width="185" height="125" rx="10" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="332" y="103" text-anchor="middle" class="boxtitle">2. Hot / cold folding</text>
+      <text x="332" y="126" text-anchor="middle" class="small">hotRunWindow (default 2)</text>
+      <text x="332" y="144" text-anchor="middle" class="small">retains tool-bearing runs</text>
+      <text x="332" y="162" text-anchor="middle" class="small">folds old content &amp; output</text>
+      <text x="332" y="180" text-anchor="middle" class="small">drops old base64 images</text>
+
+      <rect x="460" y="75" width="185" height="125" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="552" y="103" text-anchor="middle" class="boxtitle">3. Drift detection</text>
+      <text x="552" y="126" text-anchor="middle" class="small">compares observedFileHashes</text>
+      <text x="552" y="144" text-anchor="middle" class="small">against live OPFS tree</text>
+      <text x="552" y="162" text-anchor="middle" class="small">injects [DRIFT NOTE]</text>
+      <text x="552" y="180" text-anchor="middle" class="small">on edit or deletion</text>
+
+      <rect x="680" y="75" width="180" height="125" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5"/>
+      <text x="770" y="103" text-anchor="middle" class="boxtitle">4. Guard &amp; budget</text>
+      <text x="770" y="126" text-anchor="middle" class="small">closes interrupted calls</text>
+      <text x="770" y="144" text-anchor="middle" class="small">skips empty failed retries</text>
+      <text x="770" y="162" text-anchor="middle" class="small">enforces maxCharBudget</text>
+      <text x="770" y="180" text-anchor="middle" class="small">without orphan tools</text>
+
+      <line x1="205" y1="137" x2="238" y2="137" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="425" y1="137" x2="458" y2="137" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="645" y1="137" x2="678" y2="137" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Every round is assembled purely from committed state: the live
+    OPFS tree, the session's journaled turns, and the current round's routed
+    specialist capsules.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>Hot-run window with substantive retention.</strong>
+    <code>selectHotRunIds</code> keeps the latest run plus recent tool-bearing
+    runs within <code>hotRunWindow</code> (default <code>2</code>), so a brief
+    conversational turn does not evict the prior tool turn that wrote the
+    workspace files. Older runs fold large file-write payloads
+    (<code>&lt;folded N chars; read from OPFS if needed&gt;</code>) and tool
+    outputs over 200 characters.</li>
+    <li><strong>OPFS <code>sha256</code> drift notes.</strong> Every
+    <code>ToolResultCommitted</code> records the <code>sha256</code> hashes of
+    files it read or wrote (<code>observedFileHashes</code>). If a user upload
+    or another chat session later modifies or deletes one of those files,
+    <code>buildDriftAnnotation</code> appends a <code>[DRIFT NOTE]</code>
+    telling the model to call <code>workspace.read_file</code> before editing.</li>
+    <li><strong>Interrupted tool-call repair.</strong> If a prior run was
+    stopped or interrupted after <code>ToolIntentLogged</code> before
+    <code>ToolResultCommitted</code> could be written (for example, when
+    switching workspaces mid-tool), <code>ContextBuilder</code> synthesizes a
+    closing <code>TOOL_CALL_INTERRUPTED</code> tool message so subsequent
+    OpenAI turns never fail strict <code>tool_call_id</code> pairing.</li>
+  </ul>
+
+  <h2>Multi-tool batches, loop guards, and error recovery</h2>
+  <p>Inside <code>AgentKernelRuntime.executeInferenceCycle</code>, each user
+  turn can run up to 10 inference-and-tool rounds (<code>maxToolRounds = 10</code>):</p>
+  <ol>
+    <li><strong>Sequential batch execution with approval pause/resume.</strong>
+    When the model emits multiple tool calls in a single turn,
+    <code>executeToolCallBatch</code> runs them in order. If a call in the
+    middle of the batch requires user approval (such as
+    <code>workspace.delete_file</code>), the kernel journals the remaining
+    calls in <code>ApprovalRequested.payload.remainingToolCalls</code>, pauses
+    in <code>awaiting_approval</code>, and resumes the rest of the batch once
+    <code>resolveApproval</code> completes.</li>
+    <li><strong>Duplicate-call loop guard.</strong> Repeating the exact same
+    <code>toolName:argumentsJson</code> signature within a run is intercepted
+    by <code>recordRepeatedCallLoopGuard</code>, which commits a synthetic
+    <code>LOOP_GUARD_TRIGGERED</code> tool result instructing the model to
+    inspect existing workspace state instead of looping.</li>
+    <li><strong>Recoverable errors vs. uncertain side effects.</strong>
+    <code>executeToolWithSafeFallback</code> catches non-abort errors thrown by
+    <code>pure_read</code> and <code>idempotent_write</code> tools and returns
+    them as <code>ToolResultCommitted</code> (<code>ToolError: …</code>) so the
+    model can self-correct on the next round. Only <code>non_idempotent</code>
+    tools halt the run in <code>interrupted: uncertain_tool_outcome</code>
+    (<code>KERN-INV-02</code>).</li>
+  </ol>
+
+  <h2>Sessions and subagent delegation</h2>
+  <p><code>AgentManager</code> (<code>src/kernel/agent-session.ts</code>)
+  multiplexes independent chat sessions over a single workspace's files.
+  Calling <code>agent.delegate</code> (or its <code>agent.spawn</code> alias)
+  spawns an isolated child session (<code>sub-&lt;role&gt;-…</code>) whose messages
+  stay out of the parent's context window—only the child's final JSON summary
+  returns to the parent tool call.</p>
+  <table>
+    <tr><th>Boundary</th><th>Enforcement</th></tr>
+    <tr><td>Reserved session IDs</td><td>Child calls cannot target <code>session-main</code>, their own parent, or another session's child (<code>ERR_DELEGATE_RESERVED_SESSION_ID</code>).</td></tr>
+    <tr><td>Tool capability ceiling</td><td>Child sessions always set <code>unrestrictedTools: false</code> and intersect requested <code>allowedTools</code> with the caller's <code>delegatableTools ?? allowedTools</code> ceiling (defaulting to read-only inspection tools when omitted).</td></tr>
+    <tr><td>Origin-scoped credentials</td><td>A child session that overrides <code>baseUrl</code> only inherits the parent provider's <code>apiKey</code> when both URLs share the exact HTTP origin.</td></tr>
+    <tr><td>Cascading cancellation</td><td>Stopping a parent run aborts any active delegated child run and bubbles non-idempotent child tool uncertainty to the parent.</td></tr>
+  </table>
+
+  <h2>Browser-native tool suite</h2>
+  <p><code>BrowserToolRegistry</code> (<code>src/kernel/tools.ts</code>) exposes
+  workspace, compute, web, image, and delegation tools directly in the Worker,
+  and merges any remote schemas discovered from an optional Execution
+  Gateway:</p>
+  <ul>
+    <li><strong>Workspace files:</strong> <code>workspace.read_file</code>,
+    <code>workspace.list_files</code>, <code>workspace.write_file</code>,
+    <code>workspace.edit_file</code> (exact target replacement), and
+    <code>workspace.delete_file</code> (gated by interactive approval).</li>
+    <li><strong>Isolated JS compute:</strong> <code>workspace.run_script</code>
+    executes calculations against workspace text/CSV/JSON files in a
+    capability-scrubbed worker, commits staged <code>writeFile(path, data)</code>
+    updates, and returns a preview of written files alongside console/return
+    output.</li>
+    <li><strong>Public web &amp; vision:</strong> <code>web.fetch_url</code>
+    (normalizes GitHub <code>/blob/</code> links to raw content and saves binary
+    <code>Uint8Array</code> or text to OPFS via the SSRF-checked fetch proxy),
+    <code>web.search</code>, <code>workspace.inspect_image</code>,
+    <code>image.generate</code>, and <code>image.transform</code>.</li>
+  </ul>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test   # offline, no credentials</pre>
+  <p><code>tests/harness-slices.test.ts</code> verifies multi-tool batch pause
+  and resume, OPFS <code>sha256</code> drift annotations, hot-run retention,
+  origin-scoped subagent keys, capability ceilings, and
+  <code>workspace.run_script</code> / <code>web.fetch_url</code> behavior;
+  <code>tests/multimodal-subagent.test.ts</code> verifies child session
+  isolation; <code>tests/run-control.test.ts</code> verifies cascading child
+  cancellation and interrupted tool-call recovery.</p>
+
+  <footer>
+    Human companion to <code>src/kernel/runtime.ts</code>,
+    <code>src/kernel/agent-session.ts</code>, and <code>src/kernel/tools.ts</code>;
+    the code and its tests win on any disagreement. Start from the
+    <a href="architecture.html">architecture walkthrough</a>; see also the
+    <a href="routing.html">routing walkthrough</a> and the
+    <a href="workbench.html">workbench walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

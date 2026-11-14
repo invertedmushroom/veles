@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — The Isolated Preview Sandbox</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.2rem; overflow-x: auto; font-size: .85rem; }
+  .err { color: #9b2c2c; font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — The Isolated Preview Sandbox</h1>
+  <p class="lead">Agent-generated apps render inside the workbench, live, in the
+  same tab that holds your workspace. This article is about the wall between
+  those two things — invariant <code>SEC-INV-01</code> — and how the sandbox
+  still feels alive to the code running behind it.</p>
+
+  <h2>The rule</h2>
+  <p>Preview frames use <code>&lt;iframe sandbox="allow-scripts"&gt;</code> and
+  strictly never <code>allow-same-origin</code>. Without that flag the browser
+  assigns the frame an <em>opaque origin</em>: generated code has no origin
+  identity at all, so IndexedDB, OPFS, cookies, and the host page's storage are
+  unreachable by construction — not by policy. Two more flags are banned as
+  well: <code>allow-top-navigation</code> and
+  <code>allow-popups-to-escape-sandbox</code>. The attribute is not written
+  once and trusted: <code>assertIsolatedSandboxAttribute</code> re-validates it,
+  throwing <span class="err"><code>ERR_SANDBOX_MISSING_ALLOW_SCRIPTS</code></span>
+  or <span class="err"><code>ERR_SANDBOX_ORIGIN_VIOLATION</code></span> if a
+  forbidden token appears.</p>
+
+  <figure>
+    <svg viewBox="0 0 880 290" role="img" aria-label="The workbench origin holds the kernel, storage, and UI. The preview frame is an opaque-origin iframe receiving only an inlined srcdoc bundle, with a validated postMessage channel back">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="40" width="360" height="210" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="2"/>
+      <text x="200" y="70" text-anchor="middle" class="boxtitle">Workbench origin (host)</text>
+      <text x="200" y="96" text-anchor="middle" class="small">Worker kernel · journal · blobs</text>
+      <text x="200" y="114" text-anchor="middle" class="small">IndexedDB · OPFS · leases</text>
+      <text x="200" y="132" text-anchor="middle" class="small">approvals · run control</text>
+      <rect x="90" y="160" width="220" height="66" rx="8" fill="#fff" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="200" y="186" text-anchor="middle" class="small">kv snapshots · sensor feed</text>
+      <text x="200" y="204" text-anchor="middle" class="small">(opt-in, per workspace)</text>
+      <rect x="560" y="80" width="290" height="150" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="705" y="110" text-anchor="middle" class="boxtitle">Preview iframe</text>
+      <text x="705" y="133" text-anchor="middle" class="small">sandbox="allow-scripts", origin = null</text>
+      <text x="705" y="151" text-anchor="middle" class="small">no indexedDB · no OPFS · no cookies</text>
+      <text x="705" y="169" text-anchor="middle" class="small">no fetch to host routes</text>
+      <text x="705" y="196" text-anchor="middle" class="small">window.veles: kv · log · sensors · files</text>
+      <!-- arrows -->
+      <line x1="382" y1="120" x2="558" y2="130" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="470" y="112" text-anchor="middle" class="small">inlined srcdoc bundle</text>
+      <line x1="558" y1="185" x2="382" y2="180" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="470" y="200" text-anchor="middle" class="small">validated postMessage diagnostics</text>
+    </svg>
+    <figcaption>Dashed amber: the sandbox. The only channel back is
+    <code>postMessage</code>, and every message on it is validated before the
+    host acts on it.</figcaption>
+  </figure>
+
+  <h2>What generated code actually receives</h2>
+  <p><code>compileMultiFileSrcdoc</code> turns the workspace's HTML entry plus
+  its assets into one self-contained document, inlined into the frame via
+  <code>srcdoc</code> — so the preview needs no network access to render:</p>
+  <ul>
+    <li>Relative <code>&lt;script&gt;</code>, stylesheet, and
+    <code>&lt;img&gt;</code> references are resolved against the entry file's
+    directory, with <code>./</code>, <code>../</code>, and query-string forms
+    normalized; if a path misses, a basename match across the workspace is the
+    last resort.</li>
+    <li>Inlined workspace assets carry a <code>data-veles-path</code> marker;
+    images become data URLs.</li>
+    <li>When the app uses the host bridge — or mentions
+    <code>localStorage</code>/<code>fetch</code> — a bridge script is injected
+    into <code>&lt;head&gt;</code>.</li>
+  </ul>
+
+  <h2>The bridge instead of storage</h2>
+  <p>Inside the opaque origin, <code>localStorage</code> and
+  <code>sessionStorage</code> throw. Generated apps instead get
+  <code>window.veles</code>: <code>kv.get/set/remove</code> backed by per-
+  workspace stores the <em>host</em> keeps, plus <code>log()</code> and
+  opt-in device <code>sensors</code> (tilt, acceleration, pointer). The
+  consequence is deliberate: sandbox state lives where the kernel can see and
+  fence it, not where generated code can smuggle it.</p>
+
+  <h2>The way back in is narrow</h2>
+  <p>The frame may <code>postMessage</code> diagnostics out, but the host
+  accepts a message only when all of these hold:</p>
+  <ol>
+    <li>The channel tag is <code>veles:preview</code>;</li>
+    <li>its <code>generation</code> matches the currently mounted generation —
+    a stale frame from a previous preview cannot whisper;</li>
+    <li>its workspace sequence matches when one is expected;</li>
+    <li>its type is exactly <code>preview_ready</code>,
+    <code>preview_error</code>, or <code>preview_log</code>; and</li>
+    <li>its message is a string, truncated to 2000 characters.</li>
+  </ol>
+  <p>Everything else is dropped. Teardown is deterministic: the host removes
+  the frame and its listener, and disposes cleanly
+  (<code>PreviewSandboxHost.dispose</code>).</p>
+
+  <h2>Script execution beyond the iframe</h2>
+  <p>The <code>workspace.run_script</code> browser tool runs code in a
+  protected worker where <code>fetch</code> and <code>indexedDB</code> do not
+  exist, and dynamic imports of scanner-obfuscated module URLs are blocked
+  before any request leaves the page. During development and preview serving,
+  Vite supplies the protected worker and a stateless validation proxy; if the
+  services are absent, tools fail with explicit errors rather than falling back
+  to less-restricted execution.</p>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test           # offline Node suites (sandbox host, srcdoc compilation)
+npm run test:browser   # real Chromium: opaque-origin isolation, postMessage</pre>
+  <p><code>tests/kernel-tools-preview.test.ts</code> asserts the
+  <code>SEC-INV-01</code> attribute checks and srcdoc compilation;
+  <code>tests/browser/boundaries.spec.ts</code> asserts
+  <code>run_script</code> observes <code>fetch: "undefined"</code> and
+  <code>indexedDB: "undefined"</code> and that the obfuscated-import request
+  count stays zero; <code>tests/browser/workbench.spec.ts</code> asserts the
+  mounted iframe's opaque-origin <code>postMessage</code> behavior.</p>
+
+  <footer>
+    Human companion to <code>src/ui/preview-sandbox.ts</code>,
+    <code>src/kernel/tools.ts</code>, and <code>vite.config.ts</code>; the code
+    and its tests win on any disagreement. Related: the
+    <a href="architecture.html">architecture walkthrough</a> and the
+    <a href="journal.html">journal walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

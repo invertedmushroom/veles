@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — The Ephemeral Execution Gateway</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.2rem; overflow-x: auto; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — The Ephemeral Execution Gateway</h1>
+  <p class="lead">When an agent's tool needs a real filesystem or subprocess —
+  things a browser cannot grant — the call crosses to a small Node server built
+  to be disposable. The gateway owns <em>zero durable state</em>
+  (<code>SEC-INV-02</code>): kill it at any moment and the journal on the
+  browser side still tells the truth.</p>
+
+  <h2>Ephemeral by construction</h2>
+  <p>Each boot generates a fresh identity —
+  <code>gw-&lt;uuid&gt;</code> — and nothing else: no workspace store, no
+  conversation store, no database. The browser-side client pins the instance
+  identity it negotiated with and rejects responses from any other, so a
+  restarted gateway is a different service, not a confused continuation of the
+  old one. Operations the gateway remembers exist only to answer "did that
+  finish?" — they carry an expiry, are reaped when it passes, and the hard
+  ceiling on any operation is five minutes (300,000&nbsp;ms), enforced
+  regardless of what the client asked for.</p>
+
+  <figure>
+    <svg viewBox="0 0 880 280" role="img" aria-label="Browser kernel dispatches a tool operation over HTTP with bearer token and capability scope; the gateway validates, runs the tool in a temp sandbox wiped afterwards, and the kernel reconciles via the status endpoint">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="90" width="240" height="120" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="2"/>
+      <text x="140" y="120" text-anchor="middle" class="boxtitle">Browser kernel</text>
+      <text x="140" y="143" text-anchor="middle" class="small">intent + dispatch journaled</text>
+      <text x="140" y="161" text-anchor="middle" class="small">GatewayToolExecutionAdapter</text>
+      <text x="140" y="179" text-anchor="middle" class="small">pins gw-&lt;uuid&gt; identity</text>
+      <rect x="560" y="90" width="300" height="120" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="710" y="118" text-anchor="middle" class="boxtitle">Gateway (Node, disposable)</text>
+      <text x="710" y="141" text-anchor="middle" class="small">Bearer check · scope check · TTL</text>
+      <text x="710" y="159" text-anchor="middle" class="small">temp sandbox dir, wiped in finally</text>
+      <text x="710" y="177" text-anchor="middle" class="small">output redacted + sha256'd</text>
+      <rect x="330" y="15" width="220" height="46" rx="8" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="440" y="43" text-anchor="middle" class="small">status endpoint → reconciliation</text>
+      <line x1="260" y1="140" x2="558" y2="140" stroke="#5a6b84" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <text x="409" y="130" text-anchor="middle" class="small">tool.execute (streamed stages)</text>
+      <line x1="440" y1="62" x2="620" y2="88" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="480" y1="60" x2="250" y2="120" stroke="#5a6b84" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Dashed amber: the gateway — <span class="ephemeral">replaceable
+    at any moment</span>. The dotted path is crash recovery: the kernel asks
+    the status endpoint what happened to a dispatch it never saw committed.</figcaption>
+  </figure>
+
+  <h2>Every request passes four independent gates</h2>
+  <ol>
+    <li><strong>Authentication.</strong> When a token is configured, only the
+    exact <code>Bearer</code> match is accepted; tokenless operation exists for
+    local development.</li>
+    <li><strong>Protocol validation.</strong> Commands are validated against
+    the versioned protocol before anything executes.</li>
+    <li><strong>Capability scope.</strong> The requested tool must appear both
+    in the request's <code>allowedTools</code> scope and in the gateway's own
+    registered set (<code>sandbox.exec</code>, <code>sandbox.WriteFile</code>,
+    <code>inference.stream</code> by default). Scopes can constrain writable
+    paths and network access; the network allowlist is probed once per boot and
+    the result cached.</li>
+    <li><strong>Resource limits.</strong> A per-operation timeout aborts the
+    subprocess (<code>ERR_GATEWAY_TIMEOUT</code>), cancellation propagates
+    (<code>ERR_GATEWAY_OPERATION_CANCELLED</code>), and output size is
+    bounded.</li>
+  </ol>
+
+  <h2>Subprocesses in disposable sandboxes</h2>
+  <p>Executed tools run inside a fresh temporary directory
+  (<code>veles-gw-sandbox-*</code>) that is unconditionally deleted in a
+  <code>finally</code> block — on success, on error, on timeout, on expiry.
+  In restricted mode (the default), <code>node</code> subprocesses run under
+  Node's permission model (<code>--permission</code> with scoped
+  <code>--allow-fs-read</code> / <code>--allow-fs-write</code> and conditional
+  <code>--allow-net</code>) and reject host-loading startup flags
+  (<code>ERR_GATEWAY_RUNTIME_FLAG_DENIED</code>). Escape attempts fail loudly
+  with <code>ERR_GATEWAY_SANDBOX_ESCAPE</code>. Output is redacted against
+  secret patterns (<code>sk-</code>, <code>gsk_</code>, <code>apikey_</code>,
+  <code>ghp_</code>, bearer strings become <code>&lt;REDACTED&gt;</code>) before
+  it is returned, and the returned outcome carries the output's sha256
+  alongside any file updates it produced.</p>
+
+  <h2>Operations have stages, and recovery uses them</h2>
+  <p>Each operation advances through <code>ACCEPTED</code> →
+  <code>STARTED</code> → <code>COMPLETED</code>, streaming events as it goes.
+  The status endpoint reports the stage, outcome, and error code for any
+  unexpired operation — exactly what the kernel's recovery path queries after
+  a reload finds a dispatched-but-uncommitted tool call. If the gateway (or
+  its memory of the operation) is gone, the run is interrupted as
+  <code>uncertain_tool_outcome</code> rather than guessed. Cancellation is an
+  explicit abort-and-delete.</p>
+
+  <h2>Running it</h2>
+  <p>The gateway lives at <code>services/gateway/server.ts</code>, speaks plain
+  HTTP, and needs no database or configuration beyond an optional bearer
+  token. Its client adapter on the browser side is
+  <code>GatewayToolExecutionAdapter</code> in
+  <code>src/kernel/gateway-client.ts</code>; serving only the built
+  <code>dist/</code> without the gateway produces explicit tool errors — the
+  system degrades by naming what is missing, never by silently weakening
+  isolation.</p>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test   # offline, no credentials</pre>
+  <p><code>tests/gateway.test.ts</code> asserts authentication, scope
+  enforcement, TTL expiry and reaping, sandbox lifecycle, output redaction,
+  stage transitions, and the status endpoint the recovery flow depends on;
+  <code>tests/kernel-runtime.test.ts</code> covers the browser-side
+  reconciliation decisions.</p>
+
+  <footer>
+    Human companion to <code>services/gateway/server.ts</code>,
+    <code>src/kernel/gateway-client.ts</code>, and
+    <code>src/protocol/validation.ts</code>; the code and its tests win on any
+    disagreement. Related: the <a href="journal.html">journal walkthrough</a>
+    and the <a href="architecture.html">architecture walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

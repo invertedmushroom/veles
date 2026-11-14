@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — The 3-Pane Workbench</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.2rem; overflow-x: auto; font-size: .85rem; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+  .pill { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: .05em .5em; font-size: .85em; white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — The 3-Pane Workbench</h1>
+  <p class="lead">The workbench is the runtime's face: chat on the left, a
+  code-and-preview inspector on the right, and a telemetry strip that shows
+  which part of the harness is doing what, live, for every turn. Everything
+  on this page is clickable down to the journal record that produced it.</p>
+
+  <h2>Layout</h2>
+  <figure>
+    <svg viewBox="0 0 880 420" role="img" aria-label="Workbench wireframe: telemetry pills across the top of the chat pane, live pipeline bar beneath, chat messages with subagent cards on the left; the right pane tabs between Code and the sandboxed Preview; overlay browsers open Files, Journal, or Project">
+      <rect x="10" y="10" width="500" height="400" rx="10" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="30" y="34" class="boxtitle">Chat pane</text>
+      <rect x="26" y="46" width="468" height="30" rx="15" fill="#fff" stroke="#c9d4e3"/>
+      <text x="38" y="66" class="small"><tspan class="pill">⚡ Luna</tspan>  <tspan class="pill">🎯 svg-multimodal-designer</tspan>  <tspan class="pill">🧠 gpt-4o</tspan>  <tspan class="pill">🪙 165 tok</tspan>  <tspan class="pill">⏱️ 1.2s</tspan></text>
+      <rect x="26" y="84" width="468" height="24" rx="6" fill="#fff" stroke="#c9d4e3"/>
+      <text x="38" y="101" class="small">⚡ 1. Route → 🧠 2. Reason → 🔧 3. Tool / Sandbox → 💾 4. Commit</text>
+      <rect x="26" y="116" width="300" height="52" rx="8" fill="#fff" stroke="#c9d4e3"/>
+      <text x="38" y="138" class="small">assistant message…</text>
+      <rect x="26" y="176" width="468" height="40" rx="8" fill="#fffaf0" stroke="#975a16" stroke-dasharray="5 3"/>
+      <text x="38" y="192" class="small">🤖 Subagent session — model · Running · tokens</text>
+      <text x="38" y="208" class="small">scoped tools · child tool calls (expandable)</text>
+      <rect x="26" y="360" width="468" height="36" rx="8" fill="#fff" stroke="#c9d4e3"/>
+      <text x="38" y="383" class="small">prompt input…</text>
+      <rect x="530" y="10" width="340" height="400" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="550" y="34" class="boxtitle">Inspector pane</text>
+      <rect x="546" y="46" width="150" height="26" rx="6" fill="#fff" stroke="#2b6cb0"/>
+      <text x="621" y="64" text-anchor="middle" class="small">Code</text>
+      <rect x="704" y="46" width="150" height="26" rx="6" fill="#fff" stroke="#c9d4e3"/>
+      <text x="779" y="64" text-anchor="middle" class="small">Preview (sandbox)</text>
+      <rect x="546" y="82" width="308" height="300" rx="8" fill="#fff" stroke="#c9d4e3"/>
+      <text x="700" y="230" text-anchor="middle" class="small">committed workspace files,</text>
+      <text x="700" y="248" text-anchor="middle" class="small">or the generated app,</text>
+      <text x="700" y="266" text-anchor="middle" class="small">live, in the opaque-origin frame</text>
+    </svg>
+    <figcaption>Panes resize by dragging the divider (mouse or
+    <code>←</code>/<code>→</code> keys; the divider is an ARIA separator
+    between 30% and 70%), and either pane can go fullscreen. On narrow screens
+    the inspector takes over by default and the preview survives the
+    transition.</figcaption>
+  </figure>
+
+  <h2>The telemetry strip — the harness, made visible</h2>
+  <p>Every turn renders its harness decision as pills across the top of the
+  chat:</p>
+  <ul>
+    <li><span class="pill">⚡ router pill</span> — the active decision engine
+    and its tier: a Tier-1 hit names it, anything deterministic shows
+    🛡️ Tier-0 Gate, and an explicit fallback reason (timeout, not_configured,
+    below_threshold…) is tagged on the pill itself. The tooltip carries the
+    configured mode. Clicking inspects the exact journaled routing record —
+    the same <code>harnessRouting</code> payload described in the
+    <a href="routing.html">routing walkthrough</a>.</li>
+    <li><span class="pill">🎯 specialist pills</span> — one per injected
+    capsule; a run with no matches shows a muted 🎯 base-workspace instead of
+    pretending nothing happened.</li>
+    <li><span class="pill">🧠 model pill</span> — which model handled the
+    turn.</li>
+    <li><span class="pill">🪙 usage pill</span> — cumulative tokens across
+    multi-tool inference rounds, with prompt/completion split in the
+    tooltip.</li>
+    <li><span class="pill">⏱️ duration pill</span> — turn wall-clock time.</li>
+  </ul>
+
+  <h2>The live pipeline bar</h2>
+  <p>While a run is in flight, a four-stage indicator shows where it is —
+  ⚡ 1. Route → 🧠 2. Reason → 🔧 3. Tool / Sandbox → 💾 4. Commit — lighting
+  the active stage from the run's live state (inferring, awaiting approval,
+  executing a tool) and dimming completed ones. It is the journal's state
+  machine, animated.</p>
+
+  <h2>Subagent cards and tool activity</h2>
+  <p>Delegated child sessions (<code>agent.delegate</code>) appear as
+  expandable 🤖 cards: the child's session id, model, scoped tool list, run
+  state, token usage, and its own tool calls. Tool activity in the main
+  timeline carries compact target chips — the file or query a tool acted on —
+  so a twelve-tool turn reads like a story, not a log.</p>
+
+  <h2>Workspace browsers</h2>
+  <p>An overlay panel opens <strong>Files</strong> (searchable committed
+  workspace, upload into it), <strong>Journal</strong> (searchable record
+  stream — the same append-only journal the kernel commits), and
+  <strong>Project</strong> (import/export archives). The chat is never the
+  only way in: durable state is directly inspectable.</p>
+
+  <h2>Installable, offline, phone-sized</h2>
+  <p>The app ships as a PWA: the header exposes install, offline/online
+  status, display mode, screen wake lock, document fullscreen, and update
+  controls. ChatTimeline is styled through <code>--veles-chat-*</code> CSS
+  custom properties, so the component can be reused and themed inside other
+  PWAs without carrying the workbench's stylesheet along.</p>
+
+  <h2>What the tests pin down</h2>
+  <pre>npm run test:browser   # real Chromium</pre>
+  <p><code>tests/browser/workbench-ui.spec.ts</code> asserts: submitted text
+  appears immediately and Stop permits the next run; Stop at an approval keeps
+  already-committed files <em>and</em> prevents the approved effect; mobile and
+  fullscreen transitions preserve the mounted preview; and the PWA controls
+  (manifest, install, wake lock, fullscreen, update) are all exposed.
+  <code>tests/browser/workbench.spec.ts</code> exercises the real Web Locks,
+  IndexedDB, OPFS, sandboxed preview, and live SSE inference paths.</p>
+
+  <footer>
+    Human companion to <code>src/ui/VelesWorkbenchApp.tsx</code>,
+    <code>src/ui/ChatTimeline.tsx</code>, and <code>src/ui/WorkbenchLayout.tsx</code>;
+    the code and its tests win on any disagreement. Related: the
+    <a href="sandbox.html">sandbox walkthrough</a> and the
+    <a href="routing.html">routing walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — How Images Reach the Model</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — How Images Reach the Model</h1>
+  <p class="lead">Multimodality in Veles is model-facing. User chat prompts are
+  text-only — there are no image parts on <code>RunCreated</code> turns — only
+  tool results that carry an <code>imageDataUrls</code> field, which the next
+  inference round staples back onto the conversation as image parts.</p>
+
+  <h2>The mental model</h2>
+  <p>Images can enter the workspace via the Files browser upload,
+  <code>web.fetch_url</code>, or image generation tools, but they only enter the
+  model's vision context when the model calls an image tool. The model decides
+  to look, a tool loads or produces the pixels, and the harness attaches them
+  on the following round.</p>
+
+  <figure>
+    <svg viewBox="0 0 880 300" role="img" aria-label="Image journey: the model emits a tool call, the tool returns a one-line text result plus image data URLs, and the next round re-attaches the images as a synthetic user message with image parts">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="105" width="170" height="95" rx="10" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="105" y="140" text-anchor="middle" class="boxtitle">Model</text>
+      <text x="105" y="163" text-anchor="middle" class="small">emits a tool call</text>
+      <text x="105" y="181" text-anchor="middle" class="small">(its own decision)</text>
+      <rect x="260" y="105" width="220" height="95" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="370" y="135" text-anchor="middle" class="boxtitle">Tool executes</text>
+      <text x="370" y="158" text-anchor="middle" class="small">inspect_image · image.generate</text>
+      <text x="370" y="176" text-anchor="middle" class="small">image.transform · web.fetch_url</text>
+      <rect x="550" y="105" width="150" height="95" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="625" y="135" text-anchor="middle" class="boxtitle">Result</text>
+      <text x="625" y="158" text-anchor="middle" class="small">one-line text</text>
+      <text x="625" y="176" text-anchor="middle" class="small">+ imageDataUrls</text>
+      <rect x="550" y="40" width="300" height="44" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="700" y="67" text-anchor="middle" class="small">next round: synthetic user message with image parts</text>
+      <line x1="190" y1="152" x2="258" y2="152" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="480" y1="152" x2="548" y2="152" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="625" y1="105" x2="660" y2="86" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="850" y1="62" x2="850" y2="150" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="845" y="240" text-anchor="end" class="small">pixels only ever ride on user-role messages</text>
+    </svg>
+    <figcaption>The chat-completions API rejects images on tool-role messages,
+    so the harness appends a separate synthetic
+    <code>role:&nbsp;"user"</code> message —
+    <code>[Attached workspace image for tool call &lt;id&gt;]</code> plus the data
+    URLs — right after the tool result.</figcaption>
+  </figure>
+
+  <h2>The image tools</h2>
+  <ul>
+    <li><strong><code>workspace.inspect_image</code></strong> — loads an image
+    from the browser workspace into multimodal vision context. This is how the
+    agent <em>sees</em> anything, including its own generated results.</li>
+    <li><strong><code>image.generate</code> / <code>image.transform</code></strong> —
+    produce or edit an image; the committed result carries the image data URL
+    for the next round.</li>
+    <li><strong><code>web.fetch_url</code></strong> — emits no images itself,
+    but pulls remote bytes into the workspace so
+    <code>inspect_image</code> can load them.</li>
+  </ul>
+  <p>A typical chain: fetch a URL (possibly retrying, since HTML pages are not
+  image bytes), inspect the file, then transform it — each step a decision the
+  main agent made and the journal recorded.</p>
+
+  <h2>Wire serialization</h2>
+  <p>When a message carries <code>imageDataUrls</code>, each URL becomes one
+  content part, by kind:</p>
+  <table>
+    <tr><th>URL kind</th><th>Wire form</th></tr>
+    <tr><td>Raster data URL (png / jpeg / webp / gif base64)</td><td>Vision part <code>{type: "image_url"}</code> — base64 embedded in the JSON request body.</td></tr>
+    <tr><td><code>http(s)://</code> URL</td><td>Vision part — sent as a link for the API to fetch.</td></tr>
+    <tr><td>SVG data URL (<code>image/svg+xml</code>, utf8 or base64)</td><td>Decoded and inlined as a <em>text</em> part, <code>[Attached SVG Image Markup]</code> — the model reads SVG as markup, no vision needed.</td></tr>
+    <tr><td>Anything else — including an SVG disguised as <code>image/png</code> (base64 payload starting <code>PHN2Zy</code>)</td><td>Silently dropped.</td></tr>
+  </table>
+
+  <h2>Context economics</h2>
+  <p>Images do not live in context forever. Attachment is gated on the hot-run
+  window — only recent runs re-carry their images (default: the last two
+  runs); older tool results keep their text (longer outputs are folded) and
+  drop their images. Even for attached images, context accounting budgets each
+  at <code>min(length, 4000)</code> characters against the round's character
+  budget, so a long run never accumulates megabytes of base64 per round.</p>
+
+  <h2>The generation cascade</h2>
+  <p><code>image.generate</code> and <code>image.transform</code> hand the
+  actual pixels to a provider cascade inside the tool handler — a sequence of
+  model calls the main agent initiated but does not supervise:</p>
+  <ol>
+    <li><strong>Remote disabled by configuration?</strong> Done before any
+    network: a local deterministic provider renders hash-seeded gradient SVG
+    artwork from the prompt. Offline runs still produce committed files.</li>
+    <li><strong>Transforms start with a vision side-call.</strong> The source
+    image and the edit instruction go to the chat-vision model, which writes a
+    vivid text-to-image prompt preserving subject, pose, and composition while
+    applying the edit. If that side-call fails, the original instruction is
+    used unchanged — the transform still proceeds.</li>
+    <li><strong>Raster endpoints, in order.</strong> An edit via the Responses
+    API's <code>image_generation</code> tool (source image inlined as
+    <code>input_image</code>), then <code>dall-e-3</code>, then
+    <code>gpt-image-1</code> via <code>/images/generations</code>, then a plain
+    Responses generation. Text-to-image endpoints cannot receive the source
+    image at all — for those, the image crosses <em>by proxy</em>, as the
+    side-call's prose.</li>
+    <li><strong>Chat-model SVG fallback.</strong> The chat model authors raw
+    <code>&lt;svg&gt;</code> XML — raster sources attached as an image part,
+    SVG sources inlined as markup.</li>
+    <li><strong>Local deterministic SVG.</strong> The same offline provider as
+    step 1, as the last resort.</li>
+  </ol>
+  <p>Provenance rides along: the prompt is tagged
+  <code>[source:&lt;workspace path&gt;]</code>, and the committed result text
+  names the path that won — for example
+  <code>[Generated raster PNG via openai:responses.image_generation]</code>. The
+  main agent sees the one-line result and the named route, and can
+  <code>inspect_image</code> the output to check it.</p>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test   # offline, no credentials</pre>
+  <p><code>tests/multimodal-subagent.test.ts</code> asserts
+  <code>inspect_image</code> producing <code>image_url</code> content parts,
+  the image character-budget accounting, SVG results from the local provider,
+  and the <code>[Attached SVG Image Markup]</code> wire form;
+  <code>tests/kernel-tools-preview.test.ts</code> asserts binary-image
+  inspection across delegation.</p>
+
+  <footer>
+    Human companion to <code>src/kernel/tools.ts</code>,
+    <code>src/kernel/runtime.ts</code>, and
+    <code>src/inference/openai-compatible.ts</code>; the code and its tests win
+    on any disagreement. Start from the
+    <a href="architecture.html">architecture walkthrough</a>; for how guidance
+    gets selected, see the <a href="routing.html">routing walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

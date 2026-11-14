@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — The Journal: Durability &amp; Recovery</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.2rem; overflow-x: auto; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — The Journal: Durability &amp; Recovery</h1>
+  <p class="lead">Every fact the system will ever need again is an appended
+  record in a content-addressed journal, owned by the Worker kernel and
+  persisted in IndexedDB. Reload is not a reset; it is a resume, because the
+  truth was written down before anything happened.</p>
+
+  <h2>Append-only, typed, complete</h2>
+  <p>The journal's record vocabulary covers a run's whole life:
+  <code>RunCreated</code>, <code>RunPreparing</code>,
+  <code>CheckpointCommitted</code>, <code>ApprovalRequested</code>,
+  <code>ToolDenied</code>, <code>ToolIntentLogged</code>,
+  <code>ToolDispatched</code>, <code>ToolResultCommitted</code>,
+  <code>RunInterrupted</code>, <code>RunCompleted</code>,
+  <code>RunCancelled</code>, <code>RunFailed</code>. Run states, interrupt
+  reasons (<code>user_reload_or_tab_close</code>,
+  <code>gateway_disconnected_safe_to_retry</code>,
+  <code>uncertain_tool_outcome</code>), and gateway operation stages are all
+  closed unions in the protocol — not string conventions.</p>
+
+  <h2>Intent before effect</h2>
+  <p>The core ordering invariant (<code>KERN-INV-01</code>): commit the tool
+  intent before its effect, and stage result blobs before publishing their
+  hashes in the journal transaction. In code, the dispatch path appends
+  <code>ToolIntentLogged</code>, then <code>ToolDispatched</code>, and only
+  then invokes the executing adapter; the result is committed last. A crash
+  anywhere in that sequence leaves a visible, interpretable trail — an intent
+  that never dispatched, or a dispatch that never committed — never a silent
+  half-effect.</p>
+
+  <figure>
+    <svg viewBox="0 0 880 300" role="img" aria-label="Execution flow: journal commits intent, then dispatch, then the adapter or gateway executes, result bytes are staged into the content-addressed blob store, and only then is the result committed to the journal">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="110" width="170" height="80" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="105" y="142" text-anchor="middle" class="boxtitle">1. Intent</text>
+      <text x="105" y="165" text-anchor="middle" class="small">ToolIntentLogged</text>
+      <rect x="235" y="110" width="170" height="80" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="320" y="142" text-anchor="middle" class="boxtitle">2. Dispatch</text>
+      <text x="320" y="165" text-anchor="middle" class="small">ToolDispatched</text>
+      <rect x="450" y="110" width="170" height="80" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="535" y="142" text-anchor="middle" class="boxtitle">3. Execute</text>
+      <text x="535" y="165" text-anchor="middle" class="small">in-Worker or gateway</text>
+      <rect x="450" y="20" width="170" height="70" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="535" y="48" text-anchor="middle" class="boxtitle">4. Stage blobs</text>
+      <text x="535" y="71" text-anchor="middle" class="small">OPFS, by sha256</text>
+      <rect x="665" y="110" width="195" height="80" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="762" y="142" text-anchor="middle" class="boxtitle">5. Commit result</text>
+      <text x="762" y="165" text-anchor="middle" class="small">ToolResultCommitted</text>
+      <line x1="190" y1="150" x2="233" y2="150" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="405" y1="150" x2="448" y2="150" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="535" y1="110" x2="535" y2="92" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="620" y1="55" x2="700" y2="108" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Solid green: journaled, durable. Dashed amber: execution,
+    <span class="ephemeral">replaceable</span>. Readers never observe
+    half-written state because bytes land in the blob store before the journal
+    names them.</figcaption>
+  </figure>
+
+  <h2>Content-addressed blobs, staged writes</h2>
+  <p>File content lives in a <code>ContentAddressedBlobStore</code> over OPFS:
+  bytes are hashed with sha256, identical content deduplicates, and reads
+  verify the hash — a missing blob is a hard
+  <code>ERR_BLOB_MISSING</code> error, not truncated output. Writes stage to a
+  temporary name and are published to the canonical hash only after staging
+  succeeds, so a failed write cannot leave a partial blob behind a valid
+  address. The journal's file tree maps paths to those hashes; context
+  building surfaces each committed file with an 8-hex prefix and annotates
+  folded prior runs when a file's hash has since drifted.</p>
+
+  <h2>One writer per workspace</h2>
+  <p>Multi-tab safety comes from Web Locks: the first tab's Worker takes the
+  workspace lease as <code>ReadWrite_Leader</code>; other tabs become
+  <code>ReadOnly_Observer</code>. Observer mode is enforced at the store level
+  — writes and mutations throw <code>ERR_READ_ONLY_OBSERVER</code> — and
+  switching or deleting a workspace releases the previous lease and acquires
+  the target workspace's lease via <code>LockProvider</code>. A deterministic
+  in-memory provider mirrors the same protocol for unit tests.</p>
+
+  <h2>Recovery: reload is a resume</h2>
+  <p>On boot the Worker acquires the lease and reads the journal tail. A run
+  left mid-flight is resolved by an explicit recovery decision: for
+  dispatched-but-uncommitted gateway operations, the kernel queries the
+  gateway's status endpoint and, when the outcome is found, commits it
+  (<code>COMMITTED_BY_BROWSER</code>); otherwise the run becomes
+  <code>RunInterrupted</code> with a named reason. The conservative rule
+  (<code>KERN-INV-02</code>) is that a dispatched non-idempotent effect whose
+  gateway vanished becomes <code>interrupted: uncertain_tool_outcome</code> —
+  it is never silently replayed. Retrying an interrupted run is an explicit
+  user act, permitted with a recorded reason.</p>
+
+  <h2>Archives and optimistic UI</h2>
+  <p>Workspaces export and import as archive bundles; restoring an older
+  archive discards newer files and journal rows rather than layering them.
+  The UI renders optimistically — a submitted prompt appears immediately as an
+  ephemeral message — but only <code>RunCreated</code> and later commits make
+  it durable, and journal events stream to the UI only after the underlying
+  commit succeeds. A quota failure mid-commit notifies no subscribers, and
+  subscriber errors or explicit <code>detach()</code> calls never affect
+  durable writes.</p>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test   # offline, no credentials</pre>
+  <p><code>tests/kernel-storage.test.ts</code> covers the journal, blobs,
+  leases, and archive round-trips; <code>tests/run-control.test.ts</code>
+  covers projection after commit, archive restore dropping newer state, Stop
+  semantics, and late-completion races;
+  <code>tests/browser/workbench.spec.ts</code> exercises the real IndexedDB,
+  OPFS, and Web Locks paths in Chromium.</p>
+
+  <footer>
+    Human companion to <code>src/kernel/journal.ts</code>,
+    <code>src/kernel/blobs.ts</code>, <code>src/kernel/lock.ts</code>, and
+    <code>src/kernel/run-cancellation.ts</code>; the code and its tests win on
+    any disagreement. Related: the <a href="gateway.html">gateway
+    walkthrough</a> and the <a href="sandbox.html">sandbox walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

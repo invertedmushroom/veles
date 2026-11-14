@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — How a Turn Gets Routed</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — How a Turn Gets Routed</h1>
+  <p class="lead">Before every inference round, the harness decides which specialist
+  guidance should ride along. The decision is deterministic where possible,
+  time-boxed where not, and always journaled before inference starts.</p>
+
+  <h2>Routing runs every round</h2>
+  <p><code>buildRoundMessages</code> executes before <em>every</em> inference
+  round of the agent loop, so routing is recomputed per round. It re-reads the
+  run's original <code>RunCreated</code> prompt each time and matches it against
+  the registered specialist profiles. The outcome is journaled as a
+  <code>CheckpointCommitted</code> record carrying
+  <code>payload.harnessRouting</code> — <code>{source, specialistIds,
+  configuredMode, fallbackReason?}</code> — committed <em>before</em> the model
+  is called. Because Tier 0 is deterministic, a replayed run reconstructs the
+  same routing decision from the same prompt.</p>
+
+  <figure>
+    <svg viewBox="0 0 880 300" role="img" aria-label="Routing flow: prompt and file paths enter two tiers; a confident Tier-1 decision or the deterministic Tier-0 fallback selects up to two specialist capsules, which are injected into the system header and journaled as a harnessRouting record">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <rect x="20" y="110" width="180" height="90" rx="10" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="110" y="145" text-anchor="middle" class="boxtitle">Prompt + paths</text>
+      <text x="110" y="168" text-anchor="middle" class="small">RunCreated text</text>
+      <text x="110" y="185" text-anchor="middle" class="small">committed OPFS paths</text>
+      <!-- Tier 1 -->
+      <rect x="290" y="30" width="250" height="100" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="415" y="60" text-anchor="middle" class="boxtitle">Tier 1 — Decision API</text>
+      <text x="415" y="83" text-anchor="middle" class="small">one predicate question per specialist</text>
+      <text x="415" y="101" text-anchor="middle" class="small">hard 800 ms deadline · threshold 0.75</text>
+      <text x="415" y="119" text-anchor="middle" class="small">returns IDs + probabilities</text>
+      <!-- Tier 0 -->
+      <rect x="290" y="180" width="250" height="90" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="2"/>
+      <text x="415" y="210" text-anchor="middle" class="boxtitle">Tier 0 — deterministic</text>
+      <text x="415" y="233" text-anchor="middle" class="small">word-boundary keyword match,</text>
+      <text x="415" y="251" text-anchor="middle" class="small">path-pattern hits · priority top-2</text>
+      <!-- Capsules -->
+      <rect x="620" y="100" width="230" height="110" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="735" y="130" text-anchor="middle" class="boxtitle">≤ 2 specialist capsules</text>
+      <text x="735" y="153" text-anchor="middle" class="small">injected into the system header</text>
+      <text x="735" y="171" text-anchor="middle" class="small">journaled as harnessRouting</text>
+      <text x="735" y="189" text-anchor="middle" class="small">before inference</text>
+      <!-- Arrows -->
+      <line x1="200" y1="140" x2="288" y2="90" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="200" y1="160" x2="288" y2="215" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="415" y1="130" x2="415" y2="178" stroke="#5a6b84" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+      <text x="452" y="160" text-anchor="middle" class="small">undecided → fallback</text>
+      <line x1="540" y1="115" x2="618" y2="150" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <line x1="540" y1="220" x2="618" y2="180" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Solid green: <span class="durable">deterministic, replayable</span>.
+    Dashed amber: <span class="ephemeral">remote, time-boxed, optional</span>.
+    A confident Tier-1 hit and a Tier-0 hit produce the same kind of record —
+    only <code>source</code> differs.</figcaption>
+  </figure>
+
+  <h2>Tier 1 — the Decision API</h2>
+  <p>When a classifier is configured, each registered specialist gets exactly one
+  predicate question — <em>"Does this task need X expertise?"</em> followed by its
+  routing hint and keywords — posted to a Decision API backed by TypeSafe
+  (<code>jev-1.14.0</code>), an OpenAI-compatible Decisions endpoint
+  (<code>gpt-6-luna</code>), or a local model (<code>laya-latest</code>) depending
+  on mode. Responses scoring ≥ the configured threshold (default <code>0.75</code>)
+  are sorted by probability and the top two specialist IDs win.</p>
+  <p>The call is hard-bounded at 800&nbsp;ms (a raced abort deadline, tunable).
+  On timeout or HTTP error the endpoint is quarantined for the rest of the
+  session — it is not asked again — and routing falls to Tier 0 with an explicit
+  reason.</p>
+
+  <h2>What the Decision API never sees</h2>
+  <p>The privacy boundary is structural, not a policy: the request carries only
+  the prompt with secret-looking tokens replaced by <code>&lt;REDACTED&gt;</code>
+  and truncated to the last 3000 characters, plus the first 20 workspace file
+  paths. Specialist capsule text never leaves the browser, and the response is
+  only specialist IDs and probabilities. The model that routes is not the model
+  that reasons, and the router cannot read your workspace.</p>
+
+  <h2>Tier 0 — deterministic matching</h2>
+  <p>Anything short of a confident Tier-1 hit — and every run with no classifier
+  configured — matches profiles locally: keyword regex with word boundaries
+  against the lowercased prompt, or a path-pattern hit where the prompt mentions
+  a workspace file. Matches are priority-sorted, capped at two. Same prompt,
+  same paths, same capsules — which is what makes the journaled routing record
+  trustworthy under replay.</p>
+
+  <h2>Undecided has a name</h2>
+  <p>Every non-hit carries an explicit <code>fallbackReason</code> on the
+  journaled record instead of silently degrading:</p>
+  <table>
+    <tr><th>Reason</th><th>Meaning</th></tr>
+    <tr><td><code>tier0_only</code></td><td>Tier 1 disabled by configuration; deterministic routing is the intended mode.</td></tr>
+    <tr><td><code>not_configured</code></td><td>No classifier is registered for the configured mode.</td></tr>
+    <tr><td><code>missing_api_key</code></td><td>The configured mode needs a key and none is present.</td></tr>
+    <tr><td><code>timeout</code></td><td>The Decision API missed its 800&nbsp;ms deadline.</td></tr>
+    <tr><td><code>http_&lt;status&gt;</code></td><td>The Decision API answered with an HTTP error (e.g. <code>http_429</code>); endpoint then quarantined.</td></tr>
+    <tr><td><code>endpoint_unavailable</code></td><td>The endpoint was already quarantined earlier in the session.</td></tr>
+    <tr><td><code>network_error</code></td><td>The request failed at the transport level.</td></tr>
+    <tr><td><code>below_threshold</code></td><td>Scores came back but none reached the threshold.</td></tr>
+    <tr><td><code>classifier_error</code></td><td>The classifier call threw.</td></tr>
+    <tr><td><code>unknown_specialist</code></td><td>The classifier named a specialist absent from the registry.</td></tr>
+  </table>
+  <p>Total miss on both tiers is also explicit: an empty capsule list, and the
+  guidance section simply is not included.</p>
+
+  <h2>Injection</h2>
+  <p>Matched capsules land in the system header, assembled in a fixed order:
+  identity line, workspace folder conventions, the preview-sandbox contract,
+  the committed OPFS file tree (each path with an 8-hex sha256 prefix), and —
+  only when at least one capsule matched — an
+  <code>--- Active In-Browser Specialist Guidance ---</code> section with each
+  capsule's prompt verbatim. The whole header ships as a single system message;
+  the conversation messages themselves are never modified by routing.</p>
+
+  <h2>The durable record — and the pill</h2>
+  <p>The routing decision the loop actually used is the one in the journal:
+  <code>payload.harnessRouting</code> with <code>source</code> of
+  <code>tier1_classifier</code> or <code>tier0_deterministic</code>. The
+  workbench's ⚡ router pill (<code>data-testid="harness-router-pill"</code>)
+  renders the latest round's record — a Tier-1 hit shows the active decision
+  engine, anything else shows 🛡️ Tier-0 Gate with the fallback reason — and
+  clicking it inspects the raw record in the run inspector.</p>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test   # offline, no credentials</pre>
+  <p><code>tests/harness-slices.test.ts</code> asserts the journaled routing
+  records for both tiers (including <code>below_threshold</code> fallback), the
+  timeout path, and the remaining fallback reasons;
+  <code>tests/run-control.test.ts</code> asserts the
+  <code>latestRouting</code> projection the pill reads.</p>
+
+  <footer>
+    Human companion to <code>src/kernel/harness-router.ts</code> and the
+    routing path of <code>src/kernel/runtime.ts</code>; the code and its tests
+    win on any disagreement. Start from the
+    <a href="architecture.html">architecture walkthrough</a>; for how images
+    reach the model, see the <a href="multimodal.html">multimodal walkthrough</a>.
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veles — Architecture Walkthrough</title>
+<style>
+  :root {
+    --ink: #1a2332; --muted: #5a6b84; --line: #c9d4e3; --panel: #f4f7fb;
+    --accent: #2b6cb0; --durable: #276749; --ephemeral: #975a16;
+  }
+  body { font: 16px/1.6 system-ui, sans-serif; color: var(--ink); margin: 0; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.2rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  figure { margin: 1.25rem 0; }
+  figcaption { font-size: .85rem; color: var(--muted); margin-top: .4rem; }
+  ol li, ul li { margin: .35rem 0; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font-size: .85rem; }
+  .durable { color: var(--durable); font-weight: 600; }
+  .ephemeral { color: var(--ephemeral); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: .8rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .8rem; }
+  svg text { font: 13px system-ui, sans-serif; fill: var(--ink); }
+  svg .small { font-size: 11px; fill: var(--muted); }
+  svg .boxtitle { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Veles — Architecture Walkthrough</h1>
+  <p class="lead">A browser-native agent runtime: the browser tab is the whole
+  computer. A Web Worker owns every durable fact; everything remote is
+  disposable.</p>
+
+  <h2>The one rule</h2>
+  <p>A single Web Worker owns workspace files, conversations, approvals, and
+  the run journal, persisted in IndexedDB and OPFS. The UI renders typed
+  projections it receives over a <code>MessagePort</code> bridge and never
+  writes state directly. Remote inference and tool execution are
+  <span class="ephemeral">ephemeral</span>: useful while running, never the
+  authority for committed state. If the network, a provider, or the gateway
+  disappears mid-run, the journal still tells the truth after reload.</p>
+
+  <h2>Who owns what</h2>
+  <figure>
+    <svg viewBox="0 0 880 320" role="img" aria-label="Veles ownership diagram: UI connects to the Worker kernel over a MessagePort; the kernel persists to IndexedDB and OPFS and calls ephemeral inference and gateway services">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6b84"/>
+        </marker>
+      </defs>
+      <!-- UI box -->
+      <rect x="20" y="100" width="200" height="120" rx="10" fill="#f4f7fb" stroke="#2b6cb0" stroke-width="1.5"/>
+      <text x="120" y="130" text-anchor="middle" class="boxtitle">UI (ephemeral view)</text>
+      <text x="120" y="155" text-anchor="middle" class="small">3-Pane Workbench</text>
+      <text x="120" y="173" text-anchor="middle" class="small">typed projections only</text>
+      <text x="120" y="191" text-anchor="middle" class="small">opaque-origin preview iframe</text>
+      <!-- Kernel box -->
+      <rect x="340" y="60" width="220" height="200" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="2"/>
+      <text x="450" y="90" text-anchor="middle" class="boxtitle">Worker kernel (authority)</text>
+      <text x="450" y="115" text-anchor="middle" class="small">run journal · blobs · leases</text>
+      <text x="450" y="133" text-anchor="middle" class="small">agent sessions · context builder</text>
+      <text x="450" y="151" text-anchor="middle" class="small">tool registry · approvals</text>
+      <text x="450" y="169" text-anchor="middle" class="small">run control · recovery</text>
+      <!-- Storage box -->
+      <rect x="660" y="60" width="200" height="88" rx="10" fill="#f4f7fb" stroke="#276749" stroke-width="1.5"/>
+      <text x="760" y="90" text-anchor="middle" class="boxtitle">Durable storage</text>
+      <text x="760" y="115" text-anchor="middle" class="small">IndexedDB (journal)</text>
+      <text x="760" y="133" text-anchor="middle" class="small">OPFS (content blobs)</text>
+      <!-- Remote box -->
+      <rect x="660" y="180" width="200" height="112" rx="10" fill="#fffaf0" stroke="#975a16" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="760" y="210" text-anchor="middle" class="boxtitle">Ephemeral remote</text>
+      <text x="760" y="235" text-anchor="middle" class="small">SSE inference adapter</text>
+      <text x="760" y="253" text-anchor="middle" class="small">execution gateway (gw-&lt;uuid&gt;)</text>
+      <text x="760" y="271" text-anchor="middle" class="small">dies without data loss</text>
+      <!-- Arrows -->
+      <line x1="220" y1="160" x2="340" y2="160" stroke="#5a6b84" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <text x="280" y="150" text-anchor="middle" class="small">MessagePort</text>
+      <line x1="560" y1="105" x2="660" y2="105" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="610" y="95" text-anchor="middle" class="small">persists</text>
+      <line x1="560" y1="235" x2="660" y2="235" stroke="#5a6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <text x="610" y="225" text-anchor="middle" class="small">calls</text>
+    </svg>
+    <figcaption>Solid green border: <span class="durable">durable authority</span>.
+    Dashed amber border: <span class="ephemeral">ephemeral, replaceable</span>.
+    Arrows show the only crossing points between layers.</figcaption>
+  </figure>
+
+  <h2>Life of a tool call</h2>
+  <ol>
+    <li><strong>Intent committed.</strong> The kernel writes the tool intent to
+    the journal before anything executes — a crash here leaves a visible,
+    recoverable record, not a mystery.</li>
+    <li><strong>Dispatch committed.</strong> The call is marked dispatched,
+    then the adapter executes it: a browser tool in-Worker, or an HTTP/SSE call
+    to the ephemeral gateway.</li>
+    <li><strong>Result staged, then committed.</strong> Output lands in the
+    content-addressed blob store first; only afterwards does the journal commit
+    the result. Readers never observe half-written state.</li>
+  </ol>
+
+  <h2>Crash recovery</h2>
+  <p>On boot the Worker acquires the workspace lease, reads the journal tail,
+  and reconciles anything that was in flight: it queries the gateway's status
+  endpoint for dispatched-but-uncommitted operations, or interrupts them with a
+  known reason. Because every transition was journaled before it happened,
+  reload is a resume, not a reset.</p>
+
+  <h2>Isolation boundaries</h2>
+  <ul>
+    <li><strong>Preview sandbox:</strong> generated apps render in an
+    opaque-origin iframe; they can never reach the kernel's storage or the
+    parent origin.</li>
+    <li><strong>Capability-scoped gateway:</strong> each gateway boot has a
+    fresh identity, a bearer check, capability scopes, bounded subprocess
+    execution in temp directories, and a hard operation TTL.</li>
+    <li><strong>Provider independence:</strong> inference is an
+    OpenAI-compatible SSE adapter; providers are configuration, not
+    architecture.</li>
+  </ul>
+
+  <h2>Verify it yourself</h2>
+  <pre>npm test              # nine Node suites, offline, no credentials
+npm run check         # strict tsc -b
+npm run test:browser  # Chromium: Web Locks, IndexedDB, OPFS, sandbox, live SSE</pre>
+
+  <footer>
+    Human companion to <code>src/protocol/types.ts</code>,
+    <code>src/kernel/</code>, <code>src/ui/</code>, and
+    <code>services/gateway/server.ts</code>; when they disagree, the code and
+    its tests win. Operational entrypoint: <code>README.md</code>.<br>
+    Deep-dives: <a href="harness.html">in-browser harness</a> ·
+    <a href="routing.html">turn routing</a> ·
+    <a href="multimodal.html">multimodal images</a> ·
+    <a href="sandbox.html">preview sandbox</a> ·
+    <a href="journal.html">journal &amp; recovery</a> ·
+    <a href="gateway.html">execution gateway</a> ·
+    <a href="workbench.html">3-pane workbench</a>.
+  </footer>
+</main>
+</body>
+</html>
