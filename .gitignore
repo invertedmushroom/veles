@@ -15,3 +15,6 @@ wheels/
 !.env.example
 
 node_modules/
+*.tsbuildinfo
+test-results/
+playwright-report/

@@ -102,3 +102,17 @@ automatically when `VITE_TYPESAFE_API_KEY` is unconfigured; the live OpenAI SSE
 case requires `VITE_OPENAI_API_KEY` (or `OPENAI_API_KEY`). All other browser
 cases in `workbench.spec.ts`, `workbench-ui.spec.ts`, and `boundaries.spec.ts`
 run offline against deterministic fixtures.
+
+## Deploy to GitHub Pages
+
+The [Pages workflow](.github/workflows/pages.yml) builds the static browser PWA
+and standalone `docs/*.html` walkthroughs on pushes to `main`. In GitHub, select
+**Settings → Pages → Source → GitHub Actions**.
+
+The Pages build uses relative asset paths (`/veles/`) and defaults the browser
+workbench to the offline `veles-demo` provider and `tier0-only` deterministic
+routing (`VITE_DEFAULT_PROVIDER=veles-demo`, `VITE_DEFAULT_DECISION_MODE=tier0-only`)
+so visitors can run the full Web Worker + IndexedDB/OPFS + sandboxed preview
+loop without backend services or API keys, or configure their own OpenAI /
+OpenRouter credentials in **Services (`⚙️`)**.
+

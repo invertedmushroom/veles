@@ -225,6 +225,12 @@ export default defineConfig(({ command, mode }) => {
           "http://127.0.0.1:11434/v1/decisions"
         ).trim(),
       ),
+      __VELES_DEFAULT_PROVIDER__: JSON.stringify(
+        (allEnv.VITE_DEFAULT_PROVIDER || "").trim(),
+      ),
+      __VELES_DEFAULT_DECISION_MODE__: JSON.stringify(
+        (allEnv.VITE_DEFAULT_DECISION_MODE || "").trim(),
+      ),
     },
     plugins: [
       react(),
