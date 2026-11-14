@@ -1,5 +1,7 @@
 # Veles
 
+[![open in your browser](docs/images/open.svg)](https://invertedmushroom.github.io/veles/)
+
 A browser-native agent runtime. A Web Worker owns durable workspace state —
 files, conversations, approvals, and the run journal — in IndexedDB and OPFS;
 the UI consumes typed projections over a `MessagePort` bridge; and remote
