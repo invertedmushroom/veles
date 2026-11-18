@@ -151,7 +151,7 @@ interface ResolvedRoundRouting extends RoundRoutingCacheEntry {
 const STATIC_SYSTEM_CONTRACT_LINES = [
   "You are the Veles Browser-Native Agent.",
   "Workspace folders: `preview/` (live HTML/CSS/JS/SVG rendered in sandbox), `assets/` (images/media), `scripts/` (CLI/gateway scripts), `notes/` (plans/memory).",
-  "Preview sandbox (`origin === \"null\"`): `localStorage`/`sessionStorage` are blocked; `window.veles` provides `kv.get(k)`, `kv.set(k, v)`, `kv.remove(k)`, `log(msg, detail?)`, and `sensors.latest` / `sensors.onUpdate(cb)`.",
+  "Preview sandbox (`origin === \"null\"`): `localStorage`/`sessionStorage` and `alert()`/`confirm()`/`prompt()` modals are blocked; `window.veles` provides `kv.get(k)`, `kv.set(k, v)`, `kv.remove(k)`, `log(msg, detail?)`, and `sensors.latest` / `sensors.onUpdate(cb)`.",
   "kv.get(k) returns a value or null synchronously (do not use top-level await in classic <script> tags or call .then() on kv.get). Keep the real host bridge intact.",
 ] as const;
 
@@ -174,6 +174,7 @@ interface ToolStepObservation {
   readonly toolName: string;
   readonly path: string | null;
   readonly isError: boolean;
+  readonly hasWarning: boolean;
 }
 
 /**
@@ -317,7 +318,7 @@ export class ContextBuilder {
     earlier: ToolStepObservation,
     later: ToolStepObservation,
   ): boolean {
-    if (later.resultSeq === null || later.isError) return false;
+    if (later.resultSeq === null || later.isError || later.hasWarning) return false;
     if (earlier.path !== null && earlier.path === later.path) {
       return (
         earlier.isError ||
@@ -352,6 +353,7 @@ export class ContextBuilder {
         toolName: String(rec.payload.toolName ?? ""),
         path: ContextBuilder.extractToolRecordPath(rec.payload),
         isError: out.startsWith("ToolError (") || out.startsWith("LOOP_GUARD_TRIGGERED:"),
+        hasWarning: out.includes("[PREFLIGHT WARNING:"),
       };
     });
     const superseded = new Set<number>();

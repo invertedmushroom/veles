@@ -74,6 +74,39 @@ function checkSandboxBridgeViolations(
       `window.veles.kv.get(k) in ${label} returns synchronously, not a Promise; remove .then().`,
     );
   }
+  if (/\b(?:window\.)?(alert|confirm|prompt)\s*\(/.test(stripped)) {
+    warnings.push(
+      `Modal alert()/confirm()/prompt() calls in ${label} are blocked by sandbox="allow-scripts"; render an in-page DOM/canvas overlay instead.`,
+    );
+  }
+  return warnings;
+}
+
+function checkGameplayInputPitfalls(
+  rawCode: string,
+  label: string,
+): string[] {
+  const warnings: string[] = [];
+  const hasDotKey =
+    /\.key\s*===\s*['"]Space['"]/.test(rawCode) ||
+    (/\[\s*[a-zA-Z_$][a-zA-Z0-9_$]*\.key\s*\]/.test(rawCode) &&
+      /\[\s*['"]Space['"]\s*\]/.test(rawCode) &&
+      !/\[\s*['"] ['"]\s*\]/.test(rawCode));
+  if (hasDotKey) {
+    warnings.push(
+      `KeyboardEvent.key for Spacebar in ${label} is ' ' (single space), not 'Space' (which is event.code); check keys[' '] || keys['Space'] or event.code === 'Space'.`,
+    );
+  }
+  if (
+    /\bsnake\.unshift\s*\(/.test(rawCode) &&
+    /\bsnake\.some\s*\(/.test(rawCode) &&
+    !/\bsnake\.slice\s*\(\s*1\s*\)/.test(rawCode) &&
+    /\blet\s+head\s*=\s*snake\[\s*0\s*\]/.test(rawCode)
+  ) {
+    warnings.push(
+      `${label} checks snake.some(...) with snake[0] after snake.unshift(head), causing immediate self-collision on every tick; check snake.slice(1).some(...) instead.`,
+    );
+  }
   return warnings;
 }
 
@@ -102,6 +135,7 @@ function verifyHtmlScriptBlock(
     if (syntaxErr) warnings.push(syntaxErr);
   }
   warnings.push(...checkSandboxBridgeViolations(body, label));
+  warnings.push(...checkGameplayInputPitfalls(body, label));
   const stubWarn = checkPlaceholderStubComments(body, label);
   if (stubWarn) warnings.push(stubWarn);
   const stripped = stripCommentsPreserveStrings(body);
@@ -152,6 +186,7 @@ function verifyJsPreflight(path: string, code: string): string[] {
     if (syntaxErr) warnings.push(syntaxErr);
   }
   warnings.push(...checkSandboxBridgeViolations(code, path));
+  warnings.push(...checkGameplayInputPitfalls(code, path));
   const stubWarn = checkPlaceholderStubComments(code, path);
   if (stubWarn) warnings.push(stubWarn);
   return warnings;

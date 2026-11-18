@@ -143,11 +143,34 @@ function lookupWorkspaceAsset(
 
 function toImageDataUrl(path: string, content: string): string | null {
   const trimmed = content.trim();
+  if (trimmed.startsWith("data:image/svg+xml;utf8,")) {
+    return trimmed.replace(/'/g, "%27").replace(/"/g, "%22");
+  }
   if (trimmed.startsWith("data:")) return trimmed;
   if (path.endsWith(".svg") || trimmed.startsWith("<svg")) {
     return `data:image/svg+xml;utf8,${encodeURIComponent(content).replace(/'/g, "%27")}`;
   }
   return null;
+}
+
+function resolveCssAssetUrls(
+  cssText: string,
+  files: Readonly<Record<string, string>>,
+  cssBaseDir: string,
+): { readonly css: string; readonly changed: boolean } {
+  let changed = false;
+  const css = cssText.replace(
+    /url\(\s*['"]?([^'")]+)['"]?\s*\)/gi,
+    (fullUrl, refPath) => {
+      const imgAsset = lookupWorkspaceAsset(String(refPath), files, cssBaseDir);
+      if (!imgAsset) return fullUrl;
+      const dataUrl = toImageDataUrl(imgAsset.path, imgAsset.content);
+      if (!dataUrl) return fullUrl;
+      changed = true;
+      return `url("${dataUrl}")`;
+    },
+  );
+  return { css, changed };
 }
 
 function inlineScriptImagePaths(
@@ -156,8 +179,11 @@ function inlineScriptImagePaths(
   baseDir: string,
 ): string {
   return scriptContent.replace(
-    /(['"])([^'"\r\n]+\.(?:png|jpe?g|webp|gif|svg))\1/gi,
-    (fullMatch, _quote, rawPath) => {
+    /\/\*[\s\S]*?\*\/|\/\/[^\r\n]*|`(?:\\[\s\S]|[^`\\])*`|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g,
+    (fullMatch) => {
+      const literal = /^(['"])([^'"\\\r\n]+\.(?:png|jpe?g|webp|gif|svg))\1$/i.exec(fullMatch);
+      if (!literal) return fullMatch;
+      const rawPath = literal[2];
       const asset = lookupWorkspaceAsset(String(rawPath), files, baseDir);
       if (!asset) return fullMatch;
       const dataUrl = toImageDataUrl(asset.path, asset.content);
@@ -323,14 +349,97 @@ function buildErrorBridgeScript(
       }
     }
   });
+  var _scriptSpans = /*__VELES_SCRIPT_LINE_MAP__*/[];
+  var _seenErrors = Object.create(null);
+  function _resolveSrcdocFrame(lineNum, fnName) {
+    if (!(lineNum > 0)) return null;
+    for (var s = 0; s < _scriptSpans.length; s++) {
+      var sp = _scriptSpans[s];
+      if (lineNum >= sp.startLine && lineNum < sp.startLine + sp.lineCount) {
+        var rel = lineNum - sp.startLine + 1;
+        var rawSrc = typeof _files[sp.path] === "string" ? _files[sp.path] : "";
+        var srcLine = rawSrc ? (rawSrc.split(/\\r?\\n/)[rel - 1] || "").trim() : "";
+        var loc = fnName ? fnName + " (" + sp.path + ":" + rel + ")" : sp.path + ":" + rel;
+        return { loc: loc, code: srcLine };
+      }
+    }
+    return null;
+  }
+  function _formatPreviewError(ev) {
+    var base = String((ev && ev.message) || (ev && ev.error) || "Runtime error");
+    var frames = [];
+    var stack = ev && ev.error && typeof ev.error.stack === "string" ? ev.error.stack : "";
+    if (stack) {
+      var lines = stack.split(/\\r?\\n/);
+      for (var i = 0; i < lines.length && frames.length < 2; i++) {
+        var m = /(?:at\\s+([a-zA-Z0-9_$.<>]+)\\s+\\(|([a-zA-Z0-9_$.<>]+)@)?[^():\\s]*:(\\d+):\\d+/.exec(lines[i]);
+        if (m) {
+          var hit = _resolveSrcdocFrame(Number(m[3]), m[1] || m[2] || "");
+          if (hit && (!frames.length || frames[frames.length - 1].loc !== hit.loc)) frames.push(hit);
+        }
+      }
+    }
+    if (!frames.length && ev && ev.lineno) {
+      var directHit = _resolveSrcdocFrame(Number(ev.lineno), "");
+      if (directHit) frames.push(directHit);
+    }
+    if (!frames.length) return base;
+    var chain = frames.map(function(f) { return f.loc; }).join(" <- ");
+    var snippet = frames[0].code ? " -> " + frames[0].code.slice(0, 120) : "";
+    return base + " [at " + chain + snippet + "]";
+  }
+  function _postPreviewError(msg) {
+    _seenErrors[msg] = (_seenErrors[msg] || 0) + 1;
+    if (_seenErrors[msg] > 3) return;
+    parent.postMessage({ channel: "veles:preview", generation: ${generation}, workspaceSeq: ${workspaceSeq}, type: "preview_error", message: msg }, "*");
+  }
+  window.addEventListener("error", function(ev) {
+    _postPreviewError(_formatPreviewError(ev));
+  });
+  window.addEventListener("unhandledrejection", function(ev) {
+    _postPreviewError("Unhandled rejection: " + String(ev.reason));
+  });
+  window.alert = function(msg) {
+    var text = String(msg !== undefined ? msg : "");
+    parent.postMessage({ channel: "veles:preview", generation: ${generation}, workspaceSeq: ${workspaceSeq}, type: "preview_log", message: "alert: " + text }, "*");
+    try {
+      if (typeof document !== "undefined" && document.body) {
+        var el = document.getElementById("__veles_alert_toast__");
+        if (!el) {
+          el = document.createElement("div");
+          el.id = "__veles_alert_toast__";
+          el.setAttribute("style", "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#101c25;color:#f4f7f6;border:1px solid #3b82f6;border-radius:8px;padding:8px 14px;font:600 13px/1.4 system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,0.35);cursor:pointer;");
+          el.onclick = function() { if (el.parentNode) el.parentNode.removeChild(el); };
+          document.body.appendChild(el);
+        }
+        el.textContent = text;
+      }
+    } catch (_e) {}
+  };
 })();
-window.addEventListener("error", function(ev) {
-  parent.postMessage({ channel: "veles:preview", generation: ${generation}, workspaceSeq: ${workspaceSeq}, type: "preview_error", message: String(ev.message || ev.error || "Runtime error") }, "*");
-});
-window.addEventListener("unhandledrejection", function(ev) {
-  parent.postMessage({ channel: "veles:preview", generation: ${generation}, workspaceSeq: ${workspaceSeq}, type: "preview_error", message: "Unhandled rejection: " + String(ev.reason) }, "*");
-});
 </script>`;
+}
+
+interface InlinedScriptLineSpan {
+  readonly path: string;
+  readonly startLine: number;
+  readonly lineCount: number;
+}
+
+function populateInlinedScriptLineMap(srcdoc: string): string {
+  const token = "/*__VELES_SCRIPT_LINE_MAP__*/[]";
+  if (!srcdoc.includes(token)) return srcdoc;
+  const spans: InlinedScriptLineSpan[] = [];
+  const re =
+    /<script\b[^>]*\bdata-veles-path="([^"]+)"[^>]*>\n([\s\S]*?)\n<\/script>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(srcdoc)) !== null) {
+    const openEndIdx = match.index + match[0].indexOf(">\n") + 2;
+    const startLine = srcdoc.slice(0, openEndIdx).split("\n").length;
+    const lineCount = (match[2] ?? "").split("\n").length;
+    spans.push({ path: match[1] ?? "script.js", startLine, lineCount });
+  }
+  return srcdoc.replace(token, safeJsonForInlineScript(spans));
 }
 
 /**
@@ -368,20 +477,28 @@ export function compileMultiFileSrcdoc(
     inlinedAny = true;
     const cssDirIdx = asset.path.lastIndexOf("/");
     const cssBaseDir = cssDirIdx >= 0 ? asset.path.slice(0, cssDirIdx) : baseDir;
-    const resolvedCss = asset.content.replace(
-      /url\(\s*['"]?([^'")]+)['"]?\s*\)/gi,
-      (fullUrl, refPath) => {
-        const imgAsset = lookupWorkspaceAsset(String(refPath), bundle.files, cssBaseDir);
-        if (!imgAsset) return fullUrl;
-        if (imgAsset.content.startsWith("data:")) return `url("${imgAsset.content}")`;
-        if (imgAsset.path.endsWith(".svg")) {
-          return `url("data:image/svg+xml;utf8,${encodeURIComponent(imgAsset.content)}")`;
-        }
-        return fullUrl;
-      },
+    const { css: resolvedCss } = resolveCssAssetUrls(
+      asset.content,
+      bundle.files,
+      cssBaseDir,
     );
     return `<style data-veles-path="${asset.path}">\n${resolvedCss}\n</style>`;
   });
+
+  // 1b. Resolve workspace image url(...) references inside inline <style>...</style> blocks
+  compiled = compiled.replace(
+    /<style\b([^>]*)>([\s\S]*?)<\/style>/gi,
+    (full, attrs, cssBody) => {
+      if (/\bdata-veles-path\s*=/i.test(String(attrs))) return full;
+      const { css, changed } = resolveCssAssetUrls(
+        String(cssBody),
+        bundle.files,
+        baseDir,
+      );
+      if (changed) inlinedAny = true;
+      return `<style${String(attrs)}>${css}</style>`;
+    },
+  );
 
   // 2. Inline relative <script src="..."></script>
   compiled = compiled.replace(
@@ -401,10 +518,34 @@ export function compileMultiFileSrcdoc(
     },
   );
 
+  // 2b. Resolve workspace image paths inside inline <script>...</script> blocks
+  compiled = compiled.replace(
+    /<script\b([^>]*)>([\s\S]*?)<\/script>/gi,
+    (full, attrs, scriptBody) => {
+      if (
+        /\b(?:src|data-veles-path|data-veles-error-bridge)\s*=/i.test(
+          String(attrs),
+        )
+      ) {
+        return full;
+      }
+      const resolvedJs = inlineScriptImagePaths(
+        String(scriptBody),
+        bundle.files,
+        baseDir,
+      );
+      if (resolvedJs !== String(scriptBody)) {
+        inlinedAny = true;
+      }
+      return `<script${String(attrs)}>${resolvedJs}</script>`;
+    },
+  );
+
   // 3. Inline relative <img src="..."> when target is a workspace SVG or data URL
   compiled = compiled.replace(
-    /<img\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>/gi,
+    /<script\b[^>]*>[\s\S]*?<\/script>|<img\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>/gi,
     (full, pre, src, post) => {
+      if (src === undefined) return full;
       const asset = lookupWorkspaceAsset(String(src), bundle.files, baseDir);
       if (!asset) return full;
       const dataUrl = toImageDataUrl(asset.path, asset.content);
@@ -415,7 +556,7 @@ export function compileMultiFileSrcdoc(
   );
 
   const usesVelesBridge =
-    /\b(?:window\.)?veles\.(?:sensors|kv|log|files)\b|\b(?:localStorage|sessionStorage|fetch)\b/.test(
+    /\b(?:window\.)?veles\.(?:sensors|kv|log|files)\b|\b(?:localStorage|sessionStorage|fetch|alert)\b/.test(
       compiled,
     ) || Object.keys(initialKv ?? {}).length > 0;
   if (inlinedAny || usesVelesBridge) {
@@ -431,6 +572,7 @@ export function compileMultiFileSrcdoc(
     } else {
       compiled = `${bridge}\n${compiled}`;
     }
+    compiled = populateInlinedScriptLineMap(compiled);
   }
 
   return compiled;

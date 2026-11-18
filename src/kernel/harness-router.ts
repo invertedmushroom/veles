@@ -57,11 +57,11 @@ export const DEFAULT_BROWSER_SPECIALISTS: readonly InBrowserSpecialistProfile[] 
         routingHint: "Playable games and game loops; ordinary apps, articles, charts, or standalone sprites do not need game mechanics.",
         capsulePrompt: [
             "[Specialist: HTML5 Canvas & Game Builder]",
-            "- Organize multi-file apps/games under `preview/index.html`, `preview/style.css`, and `preview/script.js` (ensure `<link href=\"style.css\">` and `<script src=\"script.js\">` match your saved file paths).",
-            "- Always reference workspace images by their exact workspace path (e.g. `<img src=\"assets/horse.png\">`) in both HTML and JS.",
-            "- Deliver working gameplay for the requested genre, with visible state and usable controls; implement requested mechanics rather than placeholder gameLoop/render stubs.",
-            "- Use `requestAnimationFrame` with delta-time clamping for games, pause or stop the loop on game-over (resetting position/velocity on restart), and persist high scores or settings via `window.veles.kv.get(k)` / `window.veles.kv.set(k, v)` (never `localStorage`).",
-            "- Validate gameplay invariants: collision checks use the intended entities and geometry, simulation advances once per tick at a controlled rate, and inputs, boundaries, restart, and end states work for the requested genre.",
+            "- Organize multi-file apps/games under `preview/index.html`, `preview/style.css`, and `preview/script.js` (ensure `<link href=\"style.css\">` and `<script src=\"script.js\">` match your saved file paths), and reference workspace images by their exact path (e.g. `assets/horse.png`).",
+            "- Deliver complete working controls from turn 1 (e.g. both horizontal movement `ArrowLeft`/`ArrowRight` and jump `Space`/`ArrowUp` for platformers; 4-way movement + restart key/button on game-over for arcade/grid games).",
+            "- Throttle discrete grid games (e.g. Snake, Tetris) to a playable step interval (~100-150ms per tick) or use `requestAnimationFrame` with delta-time clamping for continuous physics; pause or stop the loop on game-over with an in-canvas/DOM overlay and restart handler (never call `alert()`/`confirm()`, which are blocked in `sandbox=\"allow-scripts\"`).",
+            "- Persist high scores or settings via `window.veles.kv.get(k)` / `window.veles.kv.set(k, v)` (never `localStorage`) and render the loaded `highScore` into the DOM/canvas immediately on startup.",
+            "- Validate gameplay invariants: (1) for Spacebar, `event.key` is `' '` while `event.code` is `'Space'` (support both); (2) in platformers, apply `y += velocityY` before clamping ground collision (`y + height >= groundY`) so jump velocity is not zeroed before leaving the ground; (3) in Snake, exclude the head from self-collision checks (`snake.slice(1)` or check before `unshift(newHead)`), and pop each snake's tail at most once per step.",
         ].join("\n"),
     },
     {

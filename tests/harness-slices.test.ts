@@ -2989,4 +2989,227 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
             globalThis.fetch = originalFetch;
         }
     });
+
+    it("preserves enclosing strings and comments while inlining image literals", () => {
+        const source = `const markup = "<img src='assets/horse.svg'>";\n// 'assets/horse.svg'\nconst image = 'assets/horse.svg';`;
+        const compiled = compileMultiFileSrcdoc({ workspaceId: "inline-literals", entryPath: "preview/index.html",
+            entryHtml: `<html><head></head><body><script>${source}</script></body></html>`,
+            files: { "assets/horse.svg": "<svg/>" },
+        });
+        const body = /<script>([\s\S]*?)<\/script>/.exec(compiled)?.[1];
+        assert.ok(body);
+        assert.doesNotThrow(() => new Function(body));
+        assert.ok(body.includes(`const markup = "<img src='assets/horse.svg'>";`));
+        assert.ok(body.includes(`// 'assets/horse.svg'`));
+        assert.match(body, /const image = "data:image\/svg/);
+    });
+
+    it("prevents ws-workspace-9-42dh repair spirals: syntax regression rejection, ambiguous line snippets, warning-aware folding, alert() preflight, and srcdoc line mapping", async () => {
+        const { store } = await createSliceWorkspace("ws-9-repair-guards");
+        const tools = new BrowserToolRegistry(store, createDefaultWorkspaceTools());
+        const validAiSnakeJs = [
+            "let aiSnake = [{ x: 320, y: 320 }];",
+            "function moveAI() {",
+            "    const possibleMoves = [{ x: -20, y: 0 }, { x: 20, y: 0 }];",
+            "    for (let move of possibleMoves) {",
+            "        aiSnake[0] = { x: aiSnake[0].x + move.x, y: aiSnake[0].y + move.y };",
+            "        break;",
+            "    }",
+            "    for (let move of possibleMoves) {",
+            "        break;",
+            "    }",
+            "}",
+        ].join("\n");
+        await store.writeWorkspaceFile("preview/script.js", validAiSnakeJs);
+
+        // 1. Ambiguous target reports exact match line numbers and numbered surrounding context
+        await assert.rejects(
+            () =>
+                tools.executeTool({
+                    runId: "r-ws9-1",
+                    operationId: "op-ws9-ambig",
+                    toolName: "workspace.edit_file",
+                    effectClass: "idempotent_write",
+                    args: {
+                        path: "preview/script.js",
+                        target: "for (let move of possibleMoves) {",
+                        replacement: "let aiNewHead = null;\n    for (let move of possibleMoves) {",
+                    },
+                }),
+            /ERR_EDIT_AMBIGUOUS_TARGET[\s\S]*lines 4, 8[\s\S]*Match 1 \(line 4\):[\s\S]*Match 2 \(line 8\):/,
+        );
+
+        // 2. Rejects edit that introduces a new JS SyntaxError into a valid JS file (e.g. replaceAll let redeclaration or stray brace)
+        await assert.rejects(
+            () =>
+                tools.executeTool({
+                    runId: "r-ws9-1",
+                    operationId: "op-ws9-syntax",
+                    toolName: "workspace.edit_file",
+                    effectClass: "idempotent_write",
+                    args: {
+                        path: "preview/script.js",
+                        target: "for (let move of possibleMoves) {",
+                        replacement: "let aiNewHead = null;\n    for (let move of possibleMoves) {\n    }\n}",
+                        replaceAll: true,
+                    },
+                }),
+            /ERR_EDIT_SYNTAX_ERROR: edit introduced JS SyntaxError in preview\/script\.js/,
+        );
+        assert.equal(await store.readFileText("preview/script.js"), validAiSnakeJs);
+
+        // 3. Preflight warns against modal alert()/confirm()/prompt() blocked in sandbox="allow-scripts"
+        const alertWarnings = verifyWorkspaceFilePreflight(
+            "preview/script.js",
+            "function resetGame() { alert('Game Over'); }",
+        );
+        assert.ok(
+            alertWarnings.some((w) => w.includes("Modal alert()/confirm()/prompt() calls")),
+            `Expected modal alert() preflight warning, got ${JSON.stringify(alertWarnings)}`,
+        );
+
+        // 4. ContextBuilder does NOT fold an earlier read_file when a later edit_file emitted a [PREFLIGHT WARNING:]
+        const longScript = `${validAiSnakeJs}\n${"// padding line\n".repeat(40)}`;
+        const baseRec = {
+            seq: 1,
+            eventId: "e-ws9-1",
+            workspaceId: "ws-9-repair-guards",
+            runId: "run-ws9-debug",
+            type: "RunCreated" as const,
+            schemaVersion: 1 as const,
+            relatedOperationId: null,
+            committedState: "created" as const,
+            timestampMs: 1,
+            payload: { prompt: "Fix AI snake error" },
+        };
+        const warningJournal = [
+            baseRec,
+            {
+                ...baseRec,
+                seq: 2,
+                type: "ToolIntentLogged" as const,
+                committedState: "awaiting_tool" as const,
+                payload: {
+                    toolCallId: "call-read-1",
+                    toolName: "workspace.read_file",
+                    args: { path: "preview/script.js" },
+                },
+            },
+            {
+                ...baseRec,
+                seq: 3,
+                type: "ToolResultCommitted" as const,
+                committedState: "inferring" as const,
+                payload: {
+                    toolCallId: "call-read-1",
+                    toolName: "workspace.read_file",
+                    outputText: longScript,
+                },
+            },
+            {
+                ...baseRec,
+                seq: 4,
+                type: "ToolIntentLogged" as const,
+                committedState: "awaiting_tool" as const,
+                payload: {
+                    toolCallId: "call-edit-warn",
+                    toolName: "workspace.edit_file",
+                    args: {
+                        path: "preview/script.js",
+                        target: "let aiSnake",
+                        replacement: "alert('hi'); let aiSnake",
+                    },
+                },
+            },
+            {
+                ...baseRec,
+                seq: 5,
+                type: "ToolResultCommitted" as const,
+                committedState: "inferring" as const,
+                payload: {
+                    toolCallId: "call-edit-warn",
+                    toolName: "workspace.edit_file",
+                    outputText:
+                        "Edited preview/script.js (1 edit applied)\n[PREFLIGHT WARNING: Modal alert()/confirm()/prompt() calls in preview/script.js are blocked]",
+                },
+            },
+        ];
+        const ctxWithWarning = ContextBuilder.buildContext(warningJournal, {
+            hotRunWindow: 2,
+        });
+        const readMsgAfterWarn = ctxWithWarning.messages.find(
+            (m) => m.role === "tool" && m.toolCallId === "call-read-1",
+        );
+        assert.equal(
+            readMsgAfterWarn?.content,
+            longScript,
+            "workspace.read_file must stay unfolded when a subsequent edit emitted [PREFLIGHT WARNING:]",
+        );
+
+        // 5. compileMultiFileSrcdoc populates _scriptSpans with exact 1-based line numbers for inlined scripts
+        const mappedSrcdoc = compileMultiFileSrcdoc({
+            workspaceId: "ws-9-repair-guards",
+            entryHtml:
+                "<!doctype html><html><head><title>Snake</title></head><body><canvas id='c'></canvas>\n<script src='script.js'></script></body></html>",
+            entryPath: "preview/index.html",
+            workspaceSeq: 14,
+            files: {
+                "preview/script.js": validAiSnakeJs,
+            },
+        });
+        assert.match(
+            mappedSrcdoc,
+            /"path":"preview\/script\.js","startLine":\d+,"lineCount":11/,
+        );
+
+        // 6. compileMultiFileSrcdoc resolves workspace image paths inside inline <script> and inline <style> blocks (ws-17 & ws-18 Horse Tinder)
+        const horseTinderSrcdoc = compileMultiFileSrcdoc({
+            workspaceId: "ws-17-18-horse-tinder",
+            entryHtml: [
+                "<!doctype html><html><head><style>.card { background-image: url('assets/horse1.png'); }</style></head>",
+                "<body><img id='horseImage' src='./assets/subject_image.jpg' alt='Horse'>",
+                "<script>",
+                "const images = ['assets/horse1.png', './assets/rainbow_subject_image.jpg'];",
+                "document.getElementById('horseImage').src = images[1];",
+                "</script></body></html>",
+            ].join("\n"),
+            entryPath: "preview/index.html",
+            workspaceSeq: 22,
+            files: {
+                "assets/horse1.png": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                "assets/subject_image.jpg": "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+                "assets/rainbow_subject_image.jpg": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+            },
+        });
+        assert.ok(
+            !horseTinderSrcdoc.includes("'assets/horse1.png'"),
+            "Inline <script> and <style> workspace image paths must be resolved to data URLs",
+        );
+        assert.ok(
+            !horseTinderSrcdoc.includes("'./assets/rainbow_subject_image.jpg'"),
+            "Inline <script> ./assets/ relative image paths must be resolved to data URLs",
+        );
+        assert.ok(
+            horseTinderSrcdoc.includes("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91Jpz"),
+        );
+
+        // 7. Preflight detects KeyboardEvent.key === 'Space' mismatch (ws-15) and post-unshift snake[0] self-collision (ws-12)
+        const ws15Warnings = verifyWorkspaceFilePreflight(
+            "preview/script.js",
+            "const keys = {}; document.addEventListener('keydown', e => { keys[e.key] = true; }); if (keys['Space']) jump();",
+        );
+        assert.ok(
+            ws15Warnings.some((w) => w.includes("KeyboardEvent.key for Spacebar")),
+            `Expected Spacebar event.key preflight warning, got ${JSON.stringify(ws15Warnings)}`,
+        );
+
+        const ws12Warnings = verifyWorkspaceFilePreflight(
+            "preview/script.js",
+            "function move() { snake.unshift(head); } function isCollision(p) { return snake.some(s => s.x === p.x); } function check() { let head = snake[0]; if (isCollision(head)) reset(); }",
+        );
+        assert.ok(
+            ws12Warnings.some((w) => w.includes("snake.slice(1).some")),
+            `Expected post-unshift snake[0] self-collision warning, got ${JSON.stringify(ws12Warnings)}`,
+        );
+    });
 });

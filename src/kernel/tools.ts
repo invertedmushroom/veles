@@ -194,7 +194,7 @@ function parseSingleEditEntry(
   const record = entry as Record<string, unknown>;
   if (typeof record.target !== "string" || record.target.length === 0) {
     throw new Error(
-      `ERR_EDIT_INVALID_ARGS: edit #${index + 1} 'target' must be a non-empty string`,
+      `ERR_EDIT_INVALID_ARGS: edit #${index + 1} 'target' must be a non-empty string (to insert new code, set 'target' to an existing anchor line and include that anchor line in 'replacement')`,
     );
   }
   if (typeof record.replacement !== "string") {
@@ -341,30 +341,118 @@ function findCollapsedWhitespaceMatchRange(
   return matchCount > 0 ? { start: firstStart, end: firstEnd, matchCount } : null;
 }
 
+function formatNumberedLineWindow(
+  content: string,
+  startLine1: number,
+  endLine1: number,
+  pad = 3,
+): string {
+  const lines = content.split("\n");
+  const from = Math.max(1, startLine1 - pad);
+  const to = Math.min(lines.length, Math.max(from, endLine1 + pad));
+  const out: string[] = [];
+  for (let ln = from; ln <= to; ln++) {
+    out.push(`  ${String(ln).padStart(3, " ")} | ${lines[ln - 1] ?? ""}`);
+  }
+  return out.join("\n");
+}
+
+function findTargetMatchLines(
+  content: string,
+  needle: string,
+  limit = 3,
+): number[] {
+  const probe = needle.includes("\n")
+    ? (needle.split("\n").find((l) => l.trim().length > 0)?.trim() ?? needle)
+    : needle;
+  if (!probe) return [];
+  const lines: number[] = [];
+  let pos = 0;
+  while (pos <= content.length - probe.length && lines.length < limit) {
+    const found = content.indexOf(probe, pos);
+    if (found === -1) break;
+    const lineNum = content.slice(0, found).split("\n").length;
+    if (!lines.includes(lineNum)) lines.push(lineNum);
+    pos = found + Math.max(1, probe.length);
+  }
+  return lines;
+}
+
+function formatAmbiguousMatchSnippet(content: string, target: string): string {
+  const matchLines = findTargetMatchLines(content, target, 3);
+  if (matchLines.length === 0) return "";
+  const previews = matchLines.map(
+    (ln, idx) =>
+      `Match ${idx + 1} (line ${ln}):\n${formatNumberedLineWindow(content, ln, ln, 1)}`,
+  );
+  return ` (e.g. lines ${matchLines.join(", ")})\n${previews.join("\n")}`;
+}
+
+function isSyntaxPreflightDiagnostic(warning: string): boolean {
+  return (
+    warning.startsWith("JS SyntaxError in ") ||
+    warning.startsWith("Invalid JSON in ")
+  );
+}
+
+function findSyntaxPreflightRegression(
+  safePath: string,
+  originalContent: string,
+  updatedContent: string,
+): string | null {
+  const hadSyntaxError = verifyWorkspaceFilePreflight(
+    safePath,
+    originalContent,
+  ).some(isSyntaxPreflightDiagnostic);
+  if (hadSyntaxError) return null;
+  return (
+    verifyWorkspaceFilePreflight(safePath, updatedContent).find(
+      isSyntaxPreflightDiagnostic,
+    ) ?? null
+  );
+}
+
+function buildEditResultSpan(
+  content: string,
+  startOffset: number,
+  endOffset: number,
+  replacement: string,
+): { readonly content: string; readonly startLine: number; readonly endLine: number } {
+  const nextContent =
+    content.slice(0, startOffset) + replacement + content.slice(endOffset);
+  const startLine = content.slice(0, startOffset).split("\n").length;
+  const repLines = replacement.split("\n").length;
+  const endLine = Math.min( startLine + Math.max(0, repLines - 1), startLine + 12 );
+  return { content: nextContent, startLine, endLine };
+}
+
 function applySingleFileEdit(
   content: string,
   edit: WorkspaceFileEditOperation,
   safePath: string,
   index: number,
-): string {
+): { readonly content: string; readonly startLine: number; readonly endLine: number } {
   const normTarget = normalizeLineEndings(edit.target);
   const normReplacement = normalizeLineEndings(edit.replacement);
   const exactCount = countSubstringOccurrences(content, normTarget);
   if (exactCount === 1) {
     const idx = content.indexOf(normTarget);
-    return (
-      content.slice(0, idx) +
-      normReplacement +
-      content.slice(idx + normTarget.length)
-    );
+    return buildEditResultSpan(content, idx, idx + normTarget.length, normReplacement);
   }
   if (exactCount > 1) {
     if (!edit.replaceAll) {
+      const matchHint = formatAmbiguousMatchSnippet(content, normTarget);
       throw new Error(
-        `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${exactCount} locations in '${safePath}'; include more surrounding context lines or set replaceAll: true`,
+        `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${exactCount} locations in '${safePath}'; include more surrounding context lines to disambiguate (only set replaceAll: true when intentionally replacing all occurrences)${matchHint}`,
       );
     }
-    return content.split(normTarget).join(normReplacement);
+    const firstIdx = content.indexOf(normTarget);
+    const startLine = content.slice(0, Math.max(0, firstIdx)).split("\n").length;
+    return {
+      content: content.split(normTarget).join(normReplacement),
+      startLine,
+      endLine: startLine + Math.min(8, normReplacement.split("\n").length - 1),
+    };
   }
   const fuzzyMatch =
     findLineTrimmedMatchRange(content, normTarget) ??
@@ -375,15 +463,12 @@ function applySingleFileEdit(
     );
   }
   if (fuzzyMatch.matchCount > 1) {
+    const matchHint = formatAmbiguousMatchSnippet(content, normTarget);
     throw new Error(
-      `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${fuzzyMatch.matchCount} line-trimmed locations in '${safePath}'; include more surrounding context lines`,
+      `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${fuzzyMatch.matchCount} line-trimmed locations in '${safePath}'; include more surrounding context lines to disambiguate${matchHint}`,
     );
   }
-  return (
-    content.slice(0, fuzzyMatch.start) +
-    normReplacement +
-    content.slice(fuzzyMatch.end)
-  );
+  return buildEditResultSpan(content, fuzzyMatch.start, fuzzyMatch.end, normReplacement);
 }
 
 const editWorkspaceFileTool: RegisteredBrowserTool = {
@@ -421,19 +506,40 @@ const editWorkspaceFileTool: RegisteredBrowserTool = {
     const edits = parseFileEditOperations(args);
     const originalContent = await store.readFileText(safePath);
     let updatedContent = normalizeLineEndings(originalContent);
+    let lastStartLine = 1;
+    let lastEndLine = 1;
     for (let i = 0; i < edits.length; i++) {
-      updatedContent = applySingleFileEdit(
+      const applied = applySingleFileEdit(
         updatedContent,
         edits[i]!,
         safePath,
         i,
+      );
+      updatedContent = applied.content;
+      lastStartLine = applied.startLine;
+      lastEndLine = applied.endLine;
+    }
+    const postEditWindow = formatNumberedLineWindow(
+      updatedContent,
+      lastStartLine,
+      lastEndLine,
+      3,
+    );
+    const syntaxRegression = findSyntaxPreflightRegression(
+      safePath,
+      originalContent,
+      updatedContent,
+    );
+    if (syntaxRegression !== null) {
+      throw new Error(
+        `ERR_EDIT_SYNTAX_ERROR: edit introduced ${syntaxRegression}; '${safePath}' was not modified. Fix the replacement syntax and retry:\n[Candidate lines around line ${lastStartLine}:]\n${postEditWindow}`,
       );
     }
     const preflightSuffix = formatPreflightDiagnosticSuffix(
       verifyWorkspaceFilePreflight(safePath, updatedContent),
     );
     return {
-      outputText: `Edited ${safePath} (${edits.length} edit${edits.length === 1 ? "" : "s"} applied, ${updatedContent.length} chars)${preflightSuffix}`,
+      outputText: `Edited ${safePath} (${edits.length} edit${edits.length === 1 ? "" : "s"} applied, ${updatedContent.length} chars)${preflightSuffix}\n[Post-edit context around line ${lastStartLine}:]\n${postEditWindow}`,
       fileUpdates: { [safePath]: updatedContent },
     };
   },

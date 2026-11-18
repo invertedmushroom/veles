@@ -1355,7 +1355,7 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
     setAutoRepairEnabled(false);
     void client.startRun(
       `run-autorepair-${Date.now()}`,
-      `Delegate a preview-repair child agent via agent.delegate to inspect and fix this runtime error in the preview files: ${latestPreviewError.message}`,
+      `Inspect and fix this runtime error directly in the preview files via workspace.read_file and workspace.edit_file/workspace.write_file (do not spawn a preview-repair child agent via agent.delegate unless direct editing cannot resolve it): ${latestPreviewError.message}`,
     ).catch(() => {});
   }, [view.inFlightRunId, autoRepairEnabled, isObserver, snap, latestPreviewError, workspaceAssetsSignature, client]);
 
@@ -1583,7 +1583,7 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
             if (latestPreviewError) {
               void client.startRun(
                 `run-fix-${Date.now()}`,
-                `Delegate a preview-repair child agent via agent.delegate to inspect and fix this runtime error in the preview files: ${latestPreviewError.message}`,
+                `Inspect and fix this runtime error directly in the preview files via workspace.read_file and workspace.edit_file/workspace.write_file (do not spawn a preview-repair child agent via agent.delegate unless direct editing cannot resolve it): ${latestPreviewError.message}`,
               ).catch(() => {});
             }
           }}
