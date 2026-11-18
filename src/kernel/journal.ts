@@ -63,6 +63,7 @@ export interface WorkspaceMetadata {
   readonly activeRunId: RunId | null;
   readonly runState: RunState | null;
   readonly updatedAtMs: number;
+  readonly historyBlobHashes?: readonly Sha256Hex[];
 }
 
 export interface WorkspaceArchiveBundle {
@@ -183,6 +184,160 @@ export class InMemoryJournalBackend implements JournalStorageBackend {
   }
 }
 
+function extractIntentTargetPath(payload: Record<string, unknown>): string | null {
+  const args =
+    typeof payload.args === "object" && payload.args !== null
+      ? (payload.args as Record<string, unknown>)
+      : null;
+  if (!args) return null;
+  for (const key of ["path", "outputPath", "saveToPath", "saveResultToPath"]) {
+    if (typeof args[key] === "string" && args[key].trim()) {
+      return normalizeSafeWorkspacePath(args[key]);
+    }
+  }
+  return null;
+}
+
+const READ_ONLY_FILE_TOOLS = new Set([
+  "workspace.read_file",
+  "workspace.inspect_image",
+  "workspace.list_files",
+]);
+
+function isReadOnlyFileTool(toolName: unknown): boolean {
+  return typeof toolName === "string" && READ_ONLY_FILE_TOOLS.has(toolName);
+}
+
+function addObservedPathsToSet(
+  observed: unknown,
+  targetSet: Set<string>,
+): void {
+  if (typeof observed !== "object" || observed === null) return;
+  for (const [p, h] of Object.entries(observed as Record<string, unknown>)) {
+    if (typeof h === "string") targetSet.add(p);
+  }
+}
+
+function collectRunTouchedPaths(
+  journal: readonly RunJournalRecord[],
+  targetRunId: RunId,
+): Set<string> {
+  const targetRuns = new Set<RunId>([targetRunId]);
+  for (const rec of journal) {
+    if (
+      rec.type === "RunCreated" &&
+      typeof rec.payload.parentRunId === "string" &&
+      targetRuns.has(rec.payload.parentRunId)
+    ) {
+      targetRuns.add(rec.runId);
+    }
+  }
+  const touched = new Set<string>();
+  for (const rec of journal) {
+    if (!targetRuns.has(rec.runId) || isReadOnlyFileTool(rec.payload.toolName)) {
+      continue;
+    }
+    addObservedPathsToSet(rec.payload.observedFileHashes, touched);
+    const intentPath = extractIntentTargetPath(rec.payload);
+    if (intentPath) touched.add(intentPath);
+  }
+  return touched;
+}
+
+function applyRecordToPriorHashes(
+  rec: RunJournalRecord,
+  prior: Record<string, Sha256Hex>,
+): void {
+  if (
+    rec.type === "CheckpointCommitted" &&
+    typeof rec.payload.uploadedPath === "string" &&
+    typeof rec.payload.sha256 === "string"
+  ) {
+    prior[rec.payload.uploadedPath] = rec.payload.sha256;
+  }
+  if (rec.type === "ToolResultCommitted") {
+    const obs = rec.payload.observedFileHashes;
+    if (typeof obs === "object" && obs !== null) {
+      for (const [p, h] of Object.entries(obs as Record<string, unknown>)) {
+        if (typeof h === "string") prior[p] = h;
+      }
+    }
+  }
+  if (
+    rec.type === "ToolIntentLogged" &&
+    rec.payload.toolName === "workspace.delete_file"
+  ) {
+    const delPath = extractIntentTargetPath(rec.payload);
+    if (delPath) delete prior[delPath];
+  }
+}
+
+function copyTreeHashes(
+  rawTree: unknown,
+  target: Record<string, Sha256Hex>,
+): void {
+  if (typeof rawTree !== "object" || rawTree === null) return;
+  for (const [p, h] of Object.entries(rawTree as Record<string, unknown>)) {
+    if (typeof h === "string") target[p] = h;
+  }
+}
+
+function buildPriorFileHashes(
+  journal: readonly RunJournalRecord[],
+  createdIdx: number,
+): Record<string, Sha256Hex> {
+  const revertedRuns = new Set<string>();
+  for (const rec of journal) {
+    if (
+      typeof rec.payload.deletedRunId === "string" &&
+      Array.isArray(rec.payload.revertedFiles) && rec.payload.revertedFiles.length > 0
+    ) {
+      revertedRuns.add(rec.payload.deletedRunId);
+    }
+  }
+  const prior: Record<string, Sha256Hex> = {};
+  const preTree = journal[createdIdx]?.payload.preRunFileTree;
+  if (revertedRuns.size === 0 && typeof preTree === "object" && preTree !== null) {
+    copyTreeHashes(preTree, prior);
+    return prior;
+  } else {
+    const firstCreated = journal.find((r) => r.type === "RunCreated");
+    copyTreeHashes(firstCreated?.payload.preRunFileTree, prior);
+  }
+  for (let i = 0; i < createdIdx; i++) {
+    const rec = journal[i]!;
+    if (!revertedRuns.has(rec.runId)) {
+      applyRecordToPriorHashes(rec, prior);
+    }
+  }
+  return prior;
+}
+
+function computeRevertedFileTreeForRun(
+  currentTree: Record<string, Sha256Hex>,
+  journal: readonly RunJournalRecord[],
+  targetRunId: RunId,
+): { readonly tree: Record<string, Sha256Hex>; readonly revertedPaths: string[] } {
+  const createdIdx = journal.findIndex(
+    (r) => r.runId === targetRunId && r.type === "RunCreated",
+  );
+  if (createdIdx === -1) {
+    return { tree: currentTree, revertedPaths: [] };
+  }
+  const touched = collectRunTouchedPaths(journal, targetRunId);
+  const prior = buildPriorFileHashes(journal, createdIdx);
+  const nextTree: Record<string, Sha256Hex> = { ...currentTree };
+  for (const path of touched) {
+    if (normalizeSafeWorkspacePath(path) !== path) throw new Error(`ERR_UNSAFE_FILE_PATH: ${path}`);
+    if (prior[path] !== undefined) {
+      nextTree[path] = prior[path]!;
+    } else {
+      delete nextTree[path];
+    }
+  }
+  return { tree: nextTree, revertedPaths: Array.from(touched).sort() };
+}
+
 export class WorkspaceKernelStore {
   private readonly commitListeners = new Set<(record: RunJournalRecord) => void>();
 
@@ -196,6 +351,8 @@ export class WorkspaceKernelStore {
   private readonly lockProvider?: LockProvider;
   private lease: WorkspaceLease;
   private activeWorkspaceId: WorkspaceId;
+  private leaseReleased = false;
+  private leaseAcquisition: Promise<WorkspaceLease> | undefined;
   private commitQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -225,7 +382,7 @@ export class WorkspaceKernelStore {
   }
 
   private assertLeaderWriteAuthority(): void {
-    if (this.lease.mode !== "ReadWrite_Leader") {
+    if (this.getLeaseMode() !== "ReadWrite_Leader") {
       throw new Error(
         "ERR_WORKSPACE_LOCKED_BY_OTHER_TAB: Secondary observer tab cannot mutate workspace state",
       );
@@ -233,18 +390,95 @@ export class WorkspaceKernelStore {
   }
 
   private async reacquireWorkspaceLease(targetWorkspaceId: WorkspaceId): Promise<void> {
-    if (!this.lockProvider || targetWorkspaceId === this.lease.workspaceId) {
+    if (targetWorkspaceId === this.lease.workspaceId && !this.leaseReleased) {
       this.activeWorkspaceId = targetWorkspaceId;
       return;
     }
+    if (!this.lockProvider) throw new Error("ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED");
     const previousLease = this.lease;
+    const wasReleased = this.leaseReleased;
     const nextLease = await this.lockProvider.acquireWorkspaceLease(
       targetWorkspaceId,
       previousLease.holderId,
     );
-    await previousLease.release();
+    if (!wasReleased) {
+      await previousLease.release();
+    }
     this.lease = nextLease;
+    this.leaseReleased = false;
     this.activeWorkspaceId = targetWorkspaceId;
+  }
+
+  public async releaseWorkspaceLease(): Promise<void> {
+    if (this.leaseReleased) return;
+    this.leaseReleased = true;
+    await this.lease.release();
+  }
+
+  private async reacquireReleasedLease(): Promise<void> {
+    if (!this.leaseReleased) return;
+    if (!this.lockProvider) throw new Error("ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED");
+    const acquisition = this.leaseAcquisition ??= this.lockProvider.acquireWorkspaceLease(
+      this.activeWorkspaceId, this.lease.holderId,
+    );
+    try {
+      this.lease = await acquisition;
+      this.leaseReleased = false;
+    } finally {
+      if (this.leaseAcquisition === acquisition) this.leaseAcquisition = undefined;
+    }
+  }
+
+  public async ensureWorkspaceLease(title?: string): Promise<WorkspaceMetadata> {
+    await this.reacquireReleasedLease();
+    const resolvedTitle = title?.trim() || this.activeWorkspaceId;
+    if (this.lease.mode === "ReadOnly_Observer") {
+      const existing = await this.journalBackend.getMetadata(this.activeWorkspaceId);
+      if (existing) return existing;
+      return {
+        workspaceId: this.activeWorkspaceId,
+        title: resolvedTitle,
+        headSeq: 0,
+        activeRunId: null,
+        runState: null,
+        updatedAtMs: Date.now(),
+      };
+    }
+    return this.initWorkspace(resolvedTitle);
+  }
+
+  public async forkForWorkspace(
+    workspaceId: WorkspaceId,
+    title?: string,
+  ): Promise<WorkspaceKernelStore> {
+    const cleanId = workspaceId.trim();
+    if (!cleanId) {
+      throw new Error("ERR_INVALID_WORKSPACE_ID: Workspace ID cannot be empty");
+    }
+    if (cleanId === this.activeWorkspaceId) {
+      await this.ensureWorkspaceLease(title);
+      return this;
+    }
+    if (!this.lockProvider) throw new Error("ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED");
+    const nextLease = await this.lockProvider.acquireWorkspaceLease(cleanId, this.lease.holderId);
+    const forked = new WorkspaceKernelStore(
+      this.journalBackend,
+      this.blobStore,
+      nextLease,
+      this.lockProvider,
+    );
+    await forked.ensureWorkspaceLease(title);
+    return forked;
+  }
+
+  public async deleteWorkspaceStorage(workspaceId: WorkspaceId): Promise<void> {
+    this.assertLeaderWriteAuthority();
+    if (workspaceId !== this.activeWorkspaceId) {
+      throw new Error("ERR_WORKSPACE_AUTHORITY_MISMATCH: Deletion requires the target workspace's own lease");
+    }
+    if (this.journalBackend.deleteWorkspace) {
+      await this.journalBackend.deleteWorkspace(workspaceId);
+    }
   }
 
   public async initWorkspace(title: string): Promise<WorkspaceMetadata> {
@@ -259,6 +493,7 @@ export class WorkspaceKernelStore {
       activeRunId: null,
       runState: null,
       updatedAtMs: Date.now(),
+      historyBlobHashes: [],
     };
     await this.journalBackend.commitAtomic(this.activeWorkspaceId, initialMeta, null, {});
     return initialMeta;
@@ -301,10 +536,10 @@ export class WorkspaceKernelStore {
 
   public async deleteWorkspace(workspaceId: WorkspaceId): Promise<WorkspaceMetadata> {
     this.assertLeaderWriteAuthority();
+    if (workspaceId !== this.activeWorkspaceId) throw new Error("ERR_WORKSPACE_AUTHORITY_MISMATCH");
+    if (!this.lockProvider) throw new Error("ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED");
     await this.assertNoActiveInFlightRun();
-    if (this.journalBackend.deleteWorkspace) {
-      await this.journalBackend.deleteWorkspace(workspaceId);
-    }
+    await this.deleteWorkspaceStorage(workspaceId);
     const remaining = await this.listWorkspaces();
     const nextWs = remaining.find((w) => w.workspaceId !== workspaceId);
     if (nextWs) {
@@ -328,7 +563,9 @@ export class WorkspaceKernelStore {
       if (!meta) {
         throw new Error(`ERR_WORKSPACE_NOT_FOUND: ${wsId}`);
       }
-      const tree = await this.stageFileUpdates(wsId, { [normalizedPath]: content });
+      const { tree, historyBlobHashes } = await this.stageFileUpdates(
+        wsId, { [normalizedPath]: content }, meta.historyBlobHashes,
+      );
       const nextSeq = meta.headSeq + 1;
       const now = Date.now();
       const record: RunJournalRecord = {
@@ -354,6 +591,7 @@ export class WorkspaceKernelStore {
         ...meta,
         headSeq: nextSeq,
         updatedAtMs: now,
+        historyBlobHashes,
       };
       await this.journalBackend.commitAtomic(wsId, nextMeta, record, tree);
     });
@@ -398,9 +636,13 @@ export class WorkspaceKernelStore {
 
   /**
    * Appends a tombstone journal record deleting a chat turn (`runId`) from
-   * `ContextBuilder` message reconstruction without modifying any workspace files.
+   * `ContextBuilder` message reconstruction, and optionally reverts any workspace
+   * files created or modified by `runId` back to their pre-turn SHA-256 blobs.
    */
-  public async deleteRun(runId: RunId): Promise<void> {
+  public async deleteRun(
+    runId: RunId,
+    options?: { readonly revertFiles?: boolean },
+  ): Promise<void> {
     this.assertLeaderWriteAuthority();
     return this.enqueueCommit(async () => {
       const wsId = this.activeWorkspaceId;
@@ -409,7 +651,17 @@ export class WorkspaceKernelStore {
       if (meta.activeRunId === runId) {
         await this.assertNoActiveInFlightRun();
       }
-      const tree = await this.journalBackend.getFileTree(wsId);
+      const currentTree = await this.journalBackend.getFileTree(wsId);
+      const journal = options?.revertFiles
+        ? await this.journalBackend.getJournalRecords(wsId)
+        : [];
+      const { tree, revertedPaths } = options?.revertFiles
+        ? computeRevertedFileTreeForRun(currentTree, journal, runId)
+        : { tree: currentTree, revertedPaths: [] as string[] };
+      await this.verifyRevertHashes(
+        revertedPaths.flatMap((path) => tree[path] ? [tree[path]!] : []),
+        meta.historyBlobHashes ?? Object.values(currentTree),
+      );
       const nextSeq = meta.headSeq + 1;
       const now = Date.now();
       const isClearingActive = meta.activeRunId === runId;
@@ -427,6 +679,7 @@ export class WorkspaceKernelStore {
           : (meta.runState ?? "completed"),
         payload: {
           deletedRunId: runId,
+          ...(revertedPaths.length > 0 ? { revertedFiles: revertedPaths } : {}),
         },
       };
       const nextMeta: WorkspaceMetadata = {
@@ -438,6 +691,23 @@ export class WorkspaceKernelStore {
       };
       await this.journalBackend.commitAtomic(wsId, nextMeta, record, tree);
     });
+  }
+
+  private async verifyRevertHashes(
+    requestedHashes: readonly Sha256Hex[],
+    ownedHashes: readonly Sha256Hex[],
+  ): Promise<void> {
+    const owned = new Set(ownedHashes);
+    for (const hash of new Set(requestedHashes)) {
+      if (!owned.has(hash)) {
+        throw new Error("ERR_REVERT_BLOB_UNAVAILABLE: This workspace archive does not contain the requested file history");
+      }
+      try {
+        await this.blobStore.getBytesVerified(hash);
+      } catch (err) {
+        throw new Error("ERR_REVERT_BLOB_UNAVAILABLE: Historical file bytes are missing or corrupted", { cause: err });
+      }
+    }
   }
 
   private async assertNoActiveInFlightRun(): Promise<void> {
@@ -505,7 +775,9 @@ export class WorkspaceKernelStore {
     }
 
     // Step 1: Write content-addressed blobs BEFORE committing the journal transaction
-    const tree = await this.stageFileUpdates(wsId, input.fileUpdates);
+    const { tree, historyBlobHashes } = await this.stageFileUpdates(
+      wsId, input.fileUpdates, meta.historyBlobHashes,
+    );
 
     const nextSeq = meta.headSeq + 1;
     const now = Date.now();
@@ -528,6 +800,7 @@ export class WorkspaceKernelStore {
       activeRunId: input.runId,
       runState: input.nextState,
       updatedAtMs: now,
+      historyBlobHashes,
     };
 
     // Step 2: Commit metadata + journal record + updated file tree atomically
@@ -542,9 +815,13 @@ export class WorkspaceKernelStore {
   private async stageFileUpdates(
     wsId: WorkspaceId,
     fileUpdates?: Readonly<Record<string, Uint8Array | string | null>>,
-  ): Promise<Record<string, Sha256Hex>> {
+    ownedHashes?: readonly Sha256Hex[],
+  ): Promise<{ tree: Record<string, Sha256Hex>; historyBlobHashes: readonly Sha256Hex[] }> {
     const tree = await this.journalBackend.getFileTree(wsId);
-    if (!fileUpdates) return tree;
+    if (!fileUpdates) {
+      return { tree, historyBlobHashes: ownedHashes ?? Object.values(tree) };
+    }
+    const history = new Set([...(ownedHashes ?? []), ...Object.values(tree)]);
     for (const [relPath, content] of Object.entries(fileUpdates)) {
       const safePath = normalizeSafeWorkspacePath(relPath);
       if (content === null) {
@@ -556,8 +833,9 @@ export class WorkspaceKernelStore {
           ? await this.blobStore.putText(content)
           : await this.blobStore.putBytes(content);
       tree[safePath] = sha256;
+      history.add(sha256);
     }
-    return tree;
+    return { tree, historyBlobHashes: [...history] };
   }
 
   public async readFileBytes(relPath: string): Promise<Uint8Array> {
@@ -569,11 +847,17 @@ export class WorkspaceKernelStore {
     return this.blobStore.getBytesVerified(hash);
   }
 
-  public async readFileText(relPath: string): Promise<string> {
+  public async readFileText(
+    relPath: string,
+    expectedSha256?: Sha256Hex,
+  ): Promise<string> {
     const tree = await this.journalBackend.getFileTree(this.activeWorkspaceId);
     const hash = tree[relPath];
     if (!hash) {
       throw new Error(`ERR_FILE_NOT_FOUND: ${relPath}`);
+    }
+    if (expectedSha256 !== undefined && hash !== expectedSha256) {
+      throw new Error(`ERR_FILE_CHANGED: ${relPath} no longer matches the requested manifest`);
     }
     return this.blobStore.getTextVerified(hash);
   }
@@ -613,7 +897,9 @@ export class WorkspaceKernelStore {
   }
 
   public getLeaseMode(): "ReadWrite_Leader" | "ReadOnly_Observer" {
-    return this.lease.mode;
+    return this.leaseReleased || this.lease.workspaceId !== this.activeWorkspaceId
+      ? "ReadOnly_Observer"
+      : this.lease.mode;
   }
 
   public async getMetadata(): Promise<WorkspaceMetadata | null> {
@@ -631,7 +917,7 @@ export class WorkspaceKernelStore {
     const journal = await this.journalBackend.getJournalRecords(wsId);
     const fileTree = await this.journalBackend.getFileTree(wsId);
     const blobsBase64 = await this.blobStore.exportBlobs(
-      Object.values(fileTree),
+      new Set([...Object.values(fileTree), ...(meta.historyBlobHashes ?? [])]),
     );
 
     return {
@@ -706,6 +992,7 @@ export class WorkspaceKernelStore {
     const importedMeta: WorkspaceMetadata = {
       ...bundle.metadata,
       workspaceId: this.activeWorkspaceId,
+      historyBlobHashes: [...verifiedBlobs.keys()],
     };
     await this.journalBackend.replaceWorkspaceAtomic(
       this.activeWorkspaceId,

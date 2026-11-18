@@ -1,4 +1,8 @@
-import type { RunJournalRecord, RunState } from "../protocol/types.ts";
+import type {
+  ContextEconomicsSummary,
+  RunJournalRecord,
+  RunState,
+} from "../protocol/types.ts";
 
 export interface ChatRun {
   readonly runId: string;
@@ -42,6 +46,7 @@ export interface RunTelemetryProjection {
   readonly durationMs: number | null;
   readonly toolCount: number;
   readonly subagentRuns: readonly SubagentRunProjection[];
+  readonly contextEconomics: ContextEconomicsSummary | null;
   readonly telemetryAnchorRecord: RunJournalRecord | null;
 }
 
@@ -268,6 +273,39 @@ function resolveRunLiveState(
   return state;
 }
 
+function numField(obj: Record<string, unknown>, key: string): number {
+  const val = obj[key];
+  return typeof val === "number" && Number.isFinite(val) ? val : 0;
+}
+
+export function extractContextEconomics(
+  records: readonly RunJournalRecord[],
+  runId: string,
+): ContextEconomicsSummary | null {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const rec = records[i]!;
+    if (rec.runId !== runId || rec.type !== "CheckpointCommitted") continue;
+    const raw = rec.payload.contextEconomics;
+    if (typeof raw !== "object" || raw === null) continue;
+    const obj = raw as Record<string, unknown>;
+    return {
+      systemContractChars: numField(obj, "systemContractChars"),
+      specialistCapsuleChars: numField(obj, "specialistCapsuleChars"),
+      workspaceTreeChars: numField(obj, "workspaceTreeChars"),
+      conversationChars: numField(obj, "conversationChars"),
+      toolIOChars: numField(obj, "toolIOChars"),
+      imageWeightChars: numField(obj, "imageWeightChars"),
+      totalChars: numField(obj, "totalChars"),
+      estimatedTokens: numField(obj, "estimatedTokens"),
+      cacheablePrefixTokens: numField(obj, "cacheablePrefixTokens"),
+      foldedSavedChars: numField(obj, "foldedSavedChars"),
+      hotRunCount: numField(obj, "hotRunCount"),
+      coldFoldedRunCount: numField(obj, "coldFoldedRunCount"),
+    };
+  }
+  return null;
+}
+
 export function projectRunTelemetry(run: ChatRun): RunTelemetryProjection {
   const ownRecords = run.records.filter((r) => r.runId === run.runId);
   const created = ownRecords.find((r) => r.type === "RunCreated");
@@ -292,6 +330,7 @@ export function projectRunTelemetry(run: ChatRun): RunTelemetryProjection {
     firstToolRecord(ownRecords, r),
   ).length;
   const subagentRuns = projectSubagentRuns(run);
+  const contextEconomics = extractContextEconomics(ownRecords, run.runId);
   return {
     providerId,
     model,
@@ -305,6 +344,7 @@ export function projectRunTelemetry(run: ChatRun): RunTelemetryProjection {
     durationMs,
     toolCount,
     subagentRuns,
+    contextEconomics,
     telemetryAnchorRecord:
       latestRouting?.record ?? completed ?? created ?? null,
   };

@@ -1,4 +1,8 @@
-import type { RunJournalRecord, RunState } from "../protocol/types.ts";
+import type {
+  ContextEconomicsSummary,
+  RunJournalRecord,
+  RunState,
+} from "../protocol/types.ts";
 import type { PendingUserTurn } from "./app-client.ts";
 import {
   firstToolRecord,
@@ -190,6 +194,46 @@ function LiveHarnessPipelineBar({
   );
 }
 
+function formatContextEconomicsTooltip(econ: ContextEconomicsSummary): string {
+  const sysTok = Math.ceil(econ.systemContractChars / 4);
+  const specTok = Math.ceil(econ.specialistCapsuleChars / 4);
+  const treeTok = Math.ceil(econ.workspaceTreeChars / 4);
+  const chatTok = Math.ceil(econ.conversationChars / 4);
+  const toolTok = Math.ceil(econ.toolIOChars / 4);
+  const foldNote =
+    econ.foldedSavedChars > 0
+      ? ` · Saved ${Math.ceil(econ.foldedSavedChars / 4)}t across ${econ.coldFoldedRunCount} cold run(s)`
+      : "";
+  return `Context Budget (~${econ.estimatedTokens} est. tok | ${econ.cacheablePrefixTokens}t cache prefix): System ${sysTok}t · Specialists ${specTok}t · Tree ${treeTok}t · Chat ${chatTok}t · Tools ${toolTok}t${foldNote}`;
+}
+
+function ContextEconomicsPill({
+  econ,
+  anchor,
+  onInspect,
+}: {
+  readonly econ: ContextEconomicsSummary;
+  readonly anchor: RunJournalRecord | null;
+  readonly onInspect: (record: RunJournalRecord) => void;
+}) {
+  const savedTokens = Math.ceil(econ.foldedSavedChars / 4);
+  return (
+    <button
+      type="button"
+      className="harness-pill metrics"
+      data-testid="harness-context-economics"
+      title={formatContextEconomicsTooltip(econ)}
+      disabled={!anchor}
+      onClick={() => {
+        if (anchor) onInspect(anchor);
+      }}
+    >
+      📐 ~{econ.estimatedTokens.toLocaleString()} ctx
+      {savedTokens > 0 ? ` · -${savedTokens}t folded` : ""}
+    </button>
+  );
+}
+
 function HarnessTelemetryStrip({
   telemetry,
   onInspect,
@@ -252,6 +296,13 @@ function HarnessTelemetryStrip({
       >
         🧠 {telemetry.model}
       </button>
+      {telemetry.contextEconomics && (
+        <ContextEconomicsPill
+          econ={telemetry.contextEconomics}
+          anchor={anchor}
+          onInspect={onInspect}
+        />
+      )}
       {telemetry.totalTokens !== null && (
         <span
           className="harness-pill metrics"
@@ -390,6 +441,32 @@ function RunEntry({
   return null;
 }
 
+const FILE_MUTATING_TOOLS = new Set([
+  "workspace.write_file",
+  "workspace.edit_file",
+  "workspace.delete_file",
+  "workspace.run_script",
+  "image.generate",
+  "image.transform",
+]);
+
+const READ_ONLY_OBSERVED_TOOLS = new Set([
+  "workspace.read_file",
+  "workspace.inspect_image",
+  "workspace.list_files",
+]);
+
+function runHasReversibleFileChanges(records: readonly RunJournalRecord[]): boolean {
+  return records.some((r) => {
+    const toolName = String(r.payload.toolName ?? "");
+    if (r.type === "ToolResultCommitted" && !READ_ONLY_OBSERVED_TOOLS.has(toolName)) {
+      const obs = r.payload.observedFileHashes;
+      return typeof obs === "object" && obs !== null && Object.keys(obs).length > 0;
+    }
+    return r.type === "ToolIntentLogged" && FILE_MUTATING_TOOLS.has(toolName);
+  });
+}
+
 function RunConversation({
   run,
   isBusy,
@@ -398,24 +475,39 @@ function RunConversation({
 }: {
   readonly run: ChatRun;
   readonly isBusy: boolean;
-  readonly onDelete: (runId: string) => void;
+  readonly onDelete: (runId: string, revertFiles?: boolean) => void;
   readonly onInspect: (record: RunJournalRecord) => void;
 }) {
   const telemetry = projectRunTelemetry(run);
+  const hasFileChanges = runHasReversibleFileChanges(run.records);
   return (
     <article className="chat-run" data-run-id={run.runId}>
       <div className="msg-card user">
         <div className="msg-meta">
           <span>YOU</span>
-          <button
-            className="wb-btn turn-delete"
-            disabled={isBusy}
-            type="button"
-            title="Delete this conversation turn; keep workspace files"
-            onClick={() => onDelete(run.runId)}
-          >
-            ✕ Delete Turn
-          </button>
+          <div style={{ display: "inline-flex", gap: 6 }}>
+            {hasFileChanges && (
+              <button
+                className="wb-btn turn-delete"
+                data-testid="turn-revert-files"
+                disabled={isBusy}
+                type="button"
+                title="Revert workspace files modified by this turn and delete the turn"
+                onClick={() => onDelete(run.runId, true)}
+              >
+                ↺ Revert Files & Turn
+              </button>
+            )}
+            <button
+              className="wb-btn turn-delete"
+              disabled={isBusy}
+              type="button"
+              title="Delete this conversation turn; keep workspace files"
+              onClick={() => onDelete(run.runId, false)}
+            >
+              ✕ Delete Turn
+            </button>
+          </div>
         </div>
         <div className="chat-content">{run.prompt}</div>
       </div>
@@ -476,7 +568,7 @@ export function ChatTimeline({
   readonly sessionId: string;
   readonly pending: PendingUserTurn | null;
   readonly isBusy: boolean;
-  readonly onDelete: (runId: string) => void;
+  readonly onDelete: (runId: string, revertFiles?: boolean) => void;
   readonly onInspect: (record: RunJournalRecord) => void;
 }) {
   const runs = projectChatRuns(journal, sessionId);

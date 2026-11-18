@@ -220,6 +220,7 @@ export interface WorkspaceSummary {
   readonly title: string;
   readonly headSeq: number;
   readonly updatedAtMs: number;
+  readonly runState?: RunState | null;
 }
 
 export type AgentSessionStatus =
@@ -345,7 +346,23 @@ export type UiToWorkerRequestPayload =
   | {
       readonly type: "DELETE_RUN";
       readonly runId: RunId;
+      readonly revertFiles?: boolean;
     };
+
+export interface ContextEconomicsSummary {
+  readonly systemContractChars: number;
+  readonly specialistCapsuleChars: number;
+  readonly workspaceTreeChars: number;
+  readonly conversationChars: number;
+  readonly toolIOChars: number;
+  readonly imageWeightChars: number;
+  readonly totalChars: number;
+  readonly estimatedTokens: number;
+  readonly cacheablePrefixTokens: number;
+  readonly foldedSavedChars: number;
+  readonly hotRunCount: number;
+  readonly coldFoldedRunCount: number;
+}
 
 export interface UiToWorkerMessage {
   readonly channel: "veles:worker-port";

@@ -6,6 +6,7 @@ export async function configureOfflineRun(page: Page, provider = "veles-demo") {
   await page.locator("#svc-chat-provider").selectOption(provider);
   await page.locator("#svc-decision-mode").selectOption("tier0-only");
   await page.getByRole("button", { name: "✕ Close Services", exact: true }).click();
+  await page.locator(".prompt-bar input[type='text']").fill("Build a sandboxed Counter App in index.html and clean up obsolete.txt");
 }
 
 export async function expectWorkspaceStatus(page: Page, text: string) {

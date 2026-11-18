@@ -60,7 +60,8 @@ export const DEFAULT_BROWSER_SPECIALISTS: readonly InBrowserSpecialistProfile[] 
             "- Organize multi-file apps/games under `preview/index.html`, `preview/style.css`, and `preview/script.js` (ensure `<link href=\"style.css\">` and `<script src=\"script.js\">` match your saved file paths).",
             "- Always reference workspace images by their exact workspace path (e.g. `<img src=\"assets/horse.png\">`) in both HTML and JS.",
             "- Deliver working gameplay for the requested genre, with visible state and usable controls; implement requested mechanics rather than placeholder gameLoop/render stubs.",
-            "- Use `requestAnimationFrame` with delta-time clamping for games, attach DOM listeners safely, and persist high scores or settings via `window.veles.kv.get(k)` / `window.veles.kv.set(k, v)` (never `localStorage`).",
+            "- Use `requestAnimationFrame` with delta-time clamping for games, pause or stop the loop on game-over (resetting position/velocity on restart), and persist high scores or settings via `window.veles.kv.get(k)` / `window.veles.kv.set(k, v)` (never `localStorage`).",
+            "- Validate gameplay invariants: collision checks use the intended entities and geometry, simulation advances once per tick at a controlled rate, and inputs, boundaries, restart, and end states work for the requested genre.",
         ].join("\n"),
     },
     {
@@ -120,8 +121,9 @@ export const DEFAULT_BROWSER_SPECIALISTS: readonly InBrowserSpecialistProfile[] 
         pathPatterns: [/^assets\/.*\.(csv|tsv)$/i],
         capsulePrompt: [
             "[Specialist: Dataset & Script Computation]",
-            "- `web.fetch_url` (optional `saveToPath`) and `workspace.run_script` (`readFile(path)`, `writeFile(path, data)`, `return result`) are independent tools: use `web.fetch_url` when downloading remote content, and `workspace.run_script` when running JS data transformations or calculations in an isolated worker (no DOM/`window`).",
+            "- Use `workspace.run_script` (Code Mode) to orchestrate multi-step data pipelines in a single round: it provides `await fetchUrl(url, saveToPath?)`, `readFile(path)`, `writeFile(path, data)`, `listFiles(prefix?)`, `searchFiles(query)`, `editFile(path, target, replacement)`, and `return result` (or use `web.fetch_url` when only downloading a file).",
             "- For interactive visualizations in `preview/`, render complete working `<canvas>` 2D or `<svg>` charts directly (never leave placeholder comments or call external chart libraries without loading their `<script>` tag), avoid top-level `await` in classic `<script>` tags, and update UI/chart state in-place on control events rather than calling `location.reload()`.",
+            "- Process the complete saved dataset with `readFile`, never transcribe the fetch output preview into final data. Check row counts and finite coordinates, and keep saved JSON keys consistent with the chart's field names.",
         ].join("\n"),
     },
     {
@@ -144,6 +146,7 @@ export const DEFAULT_BROWSER_SPECIALISTS: readonly InBrowserSpecialistProfile[] 
             "[Specialist: Preview Runtime Debugger]",
             "- Inspect the current OPFS file via `workspace.read_file` and apply the fix directly using `workspace.edit_file` (for targeted changes) or `workspace.write_file` in the same turn without stopping to ask for confirmation.",
             "- Verify DOM element IDs, data structures, and script load order inside `preview/`.",
+            "- Re-check behavior after syntax repairs: preserve required functions and verify plotted field names or collision logic instead of treating parse success as proof that the artifact works.",
             "- Remember the preview runs in an opaque origin (`origin === \"null\"` without `allow-same-origin`): never call `localStorage`, `sessionStorage`, or `indexedDB` directly, and preserve built-in `window.veles.*` host bridge calls (`kv`, `log`, `sensors`, `files`).",
         ].join("\n"),
     },
@@ -371,9 +374,9 @@ function resolveDecisionEndpointUrl(rawUrl: string): string {
 export function createDecisionClassifierAdapter(
     getConfig: () =>
         | {
-              readonly decision?: DecisionServiceConfigSpec;
-              readonly chatApiKey?: string;
-          }
+            readonly decision?: DecisionServiceConfigSpec;
+            readonly chatApiKey?: string;
+        }
         | undefined,
 ): OptionalClassifierAdapter {
     const unreachableEndpoints = new Set<string>();

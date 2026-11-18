@@ -8,6 +8,8 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DECISION_MODE_PRESETS, PROVIDER_PRESETS } from "./service-presets.ts";
+import { ModelCatalog } from "./ModelCatalog.tsx";
+import { loadServiceSettings, saveServiceSettings } from "./service-settings.ts";
 import type {
   DecisionServiceConfigSpec,
   DecisionServiceMode,
@@ -148,6 +150,8 @@ function ChatServiceCard({
           }
         />
       </div>
+      {!isObserver && <ModelCatalog key={provider.providerId + provider.baseUrl + provider.apiKey} provider={provider} onSelect={(model) => onChangeProvider({ ...provider, model })} />}
+      <p>Pinokio: enter the API URL of the launched app. WanGP media APIs require a media adapter, rather than a chat endpoint.</p>
       <div className="service-field-row">
         <label className="service-label" htmlFor="svc-chat-key">
           API Key
@@ -480,6 +484,9 @@ function WorkspaceAndDeviceCard({
 }
 
 function ServiceConfigPanel({
+  rememberKeys,
+  onRememberKeys,
+  settingsError,
   provider,
   snap,
   pwa,
@@ -489,6 +496,9 @@ function ServiceConfigPanel({
   onChangeServiceConfig,
   onClose,
 }: {
+  readonly rememberKeys: boolean;
+  readonly onRememberKeys: (value: boolean) => void;
+  readonly settingsError: string;
   readonly provider: ProviderModelConfigSpec;
   readonly snap: WorkspaceStateSnapshot | null;
   readonly pwa: PwaDeviceSessionView;
@@ -518,6 +528,7 @@ function ServiceConfigPanel({
       className="service-config-drawer"
       aria-label="Veles Service Configuration Panel"
     >
+      <div className="service-card"><label><input type="checkbox" checked={rememberKeys} onChange={(event) => onRememberKeys(event.target.checked)} /> Remember API keys in this browser</label><p>When enabled, keys are saved in browser storage.</p>{settingsError && <p role="alert">{settingsError}</p>}</div>
       <div className="service-config-header">
         <div>
           <strong>⚙️ Veles Capability &amp; Service Configuration</strong>{" "}
@@ -594,7 +605,7 @@ function TopAuthorityBar({
         onSwitchWorkspace(event.target.value, found?.title);
       }}>
       {workspaces.length === 0 && <option value={snap?.workspaceId ?? "ws-alpha"}>{snap?.title ?? "Alpha"}</option>}
-      {workspaces.map((workspace) => <option key={workspace.workspaceId} value={workspace.workspaceId}>{workspace.title}</option>)}
+      {workspaces.map((workspace) => <option key={workspace.workspaceId} value={workspace.workspaceId}>{workspace.title}{isActiveRun(workspace.runState) ? " · ⟳" : ""}</option>)}
     </select>
       <details ref={menu} className="workspace-create" onToggle={(event) => {
         if (event.currentTarget.open) event.currentTarget.querySelector("input")?.focus();
@@ -707,7 +718,7 @@ function CenterRunStreamPane({
   readonly onSubmitPrompt: () => void;
   readonly onSwitchChat: (sessionId: string, title?: string) => void;
   readonly onCreateChat: () => void;
-  readonly onDeleteRun: (runId: string) => void;
+  readonly onDeleteRun: (runId: string, revertFiles?: boolean) => void;
   readonly onApprove: (approved: boolean) => void;
   readonly onResolveUncertain: (
     res: "mark_succeeded" | "retry_anyway" | "cancel_run",
@@ -1160,6 +1171,22 @@ function syncInitialWorkspaceSelection(
 
 export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient }) {
   const [view, setView] = useState<AppClientStateView>(() => client.getStateView());
+  const importFileRef = useRef<HTMLInputElement | null>(null);
+  const [rememberKeys, setRememberKeys] = useState(() => {
+    try { return loadServiceSettings(window.localStorage)?.rememberKeys ?? false; } catch { return false; }
+  });
+  const [settingsError, setSettingsError] = useState("");
+  const savedSettingsRef = useRef("");
+  useEffect(() => {
+    const settings = { provider: view.selectedProvider, services: view.serviceConfig, rememberKeys };
+    const serialized = JSON.stringify(settings);
+    if (serialized === savedSettingsRef.current) return;
+    try {
+      saveServiceSettings(window.localStorage, settings);
+      savedSettingsRef.current = serialized;
+      setSettingsError("");
+    } catch { setSettingsError("Service settings could not be saved in this browser."); }
+  }, [view.selectedProvider, view.serviceConfig, rememberKeys]);
   const [selectedFile, setSelectedFile] = useState<string | null>("index.html");
   const [selectedRecord, setSelectedRecord] = useState<RunJournalRecord | null>(null);
   const [browserPanel, setBrowserPanel] = useState<BrowserPanel | null>(null);
@@ -1177,7 +1204,7 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
   }, [browserPanel, showServicesPanel]);
   const [rightTab, setRightTab] = useState<"code" | "preview">("preview");
   const [promptInput, setPromptInput] = useState(
-    "Build a sandboxed Counter App in index.html and clean up obsolete.txt",
+    "",
   );
   const [diagnostics, setDiagnostics] = useState<PreviewRuntimeDiagnostic[]>([]);
   const [previewGen, setPreviewGen] = useState(0);
@@ -1386,6 +1413,7 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
 
   const handleDeleteWorkspace = () => {
     if (!snap || isObserver) return;
+    if (!window.confirm("Delete this workspace and all conversations and files? This cannot be undone.")) return;
     void client
       .deleteWorkspace(snap.workspaceId)
       .then((nextSnap) => {
@@ -1411,11 +1439,16 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
   };
 
   const handleImportPrompt = () => {
-    const raw = window.prompt("Paste your exported project JSON:");
-    if (!raw) return;
+    importFileRef.current?.click();
+  };
+
+  const handleImportFile = async (file: File) => {
+    const workspaceId = client.getStateView().snapshot?.workspaceId;
     try {
+      const raw = await file.text();
+      if (client.getStateView().snapshot?.workspaceId !== workspaceId) throw new Error("Workspace changed while reading the archive. Select the file again.");
       const parsed: unknown = JSON.parse(raw);
-      void client.importWorkspace(parsed).then(resetLocalWorkspaceView).catch(() => {});
+      resetLocalWorkspaceView(await client.importWorkspace(parsed));
     } catch (err) {
       window.alert(err instanceof Error ? err.message : String(err));
     }
@@ -1442,6 +1475,7 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
         <>
           {showServicesPanel && (
             <ServiceConfigPanel
+              rememberKeys={rememberKeys} onRememberKeys={setRememberKeys} settingsError={settingsError}
               snap={snap}
               pwa={pwa}
               provider={view.selectedProvider}
@@ -1459,11 +1493,13 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
           )}
         </>
       }
-      overlay={browserPanel && <WorkspaceBrowser panel={browserPanel} snapshot={snap} selectedFile={activeFilePath}
+      overlay={<><input ref={importFileRef} type="file" accept=".json,application/json" hidden aria-label="Import project JSON"
+        onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void handleImportFile(file); }} />
+        {browserPanel && <WorkspaceBrowser panel={browserPanel} snapshot={snap} selectedFile={activeFilePath}
         selectedRecord={selectedRecord} onClose={closeBrowser} onChangePanel={setBrowserPanel}
         onSelectFile={inspectFile} onSelectRecord={inspectRecord}
         onImport={handleImportPrompt} onExport={handleExport}
-        onUpload={(path, content) => { void client.uploadWorkspaceFile(path, content).catch(() => {}); }} />}
+        onUpload={(path, content) => { void client.uploadWorkspaceFile(path, content).catch(() => {}); }} />}</>}
       chatPane={
         <CenterRunStreamPane
           snap={snap}
@@ -1503,8 +1539,9 @@ export function VelesWorkbenchApp({ client }: { readonly client: VelesAppClient 
               .switchChatSession(chatId, `Chat ${topChatCount}`)
               .catch(() => {});
           }}
-          onDeleteRun={(runId) => {
-            void client.deleteChatRun(runId).catch(() => {});
+          onDeleteRun={(runId, revertFiles) => {
+            if (!window.confirm(revertFiles ? "Delete this turn and revert its file changes?" : "Delete this conversation turn? Files will be kept.")) return;
+            void client.deleteChatRun(runId, { revertFiles }).catch(() => {});
           }}
           onApprove={(approved) => {
             if (snap?.activeRunId) {

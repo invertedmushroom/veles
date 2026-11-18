@@ -91,6 +91,20 @@ it("projects committed turns by session, associates child activity, and honors d
             configuredMode: "openai-decisions",
             specialistIds: ["data-script-compute", "diagram-design"],
           },
+          contextEconomics: {
+            systemContractChars: 420,
+            specialistCapsuleChars: 640,
+            workspaceTreeChars: 280,
+            conversationChars: 180,
+            toolIOChars: 520,
+            imageWeightChars: 0,
+            totalChars: 2040,
+            estimatedTokens: 510,
+            cacheablePrefixTokens: 265,
+            foldedSavedChars: 1200,
+            hotRunCount: 2,
+            coldFoldedRunCount: 1,
+          },
         },
       },
       {
@@ -127,6 +141,9 @@ it("projects committed turns by session, associates child activity, and honors d
     "diagram-design",
   ]);
   assert.equal(telemetry.totalTokens, 165);
+  assert.equal(telemetry.contextEconomics?.estimatedTokens, 510);
+  assert.equal(telemetry.contextEconomics?.cacheablePrefixTokens, 265);
+  assert.equal(telemetry.contextEconomics?.foldedSavedChars, 1200);
   assert.equal(telemetry.subagentRuns.length, 1);
   assert.equal(telemetry.subagentRuns[0]?.stateLabel, "Completed");
   assert.equal(telemetry.subagentRuns[0]?.totalTokens, 70);
@@ -264,6 +281,151 @@ for (const effectClass of ["idempotent_write", "non_idempotent"] as const) {
 }
 
 
+it("cleans up an approval request in its originating workspace after switching away", async () => {
+  const store = await fixture();
+  const entered = deferred();
+  const release = deferred();
+  const registry = new BrowserToolRegistry(store, [{
+    spec: { name: "test.approval", description: "Held approval", effectClass: "idempotent_write", requiresApproval: true },
+    async handler() { entered.resolve(); await release.promise; return { outputText: "done" }; },
+  }]);
+  const inference: InferenceAdapter = { async *streamChat(req) {
+    const done = req.messages.some((message) => message.role === "tool");
+    yield { providerId: "test", model: "fixture", deltaText: "", usage: null, finishReason: done ? "stop" : "tool_calls",
+      toolCalls: done ? [] : [{ id: "approval", name: "test.approval", argumentsJson: "{}" }] };
+  } };
+  const runtime = new AgentKernelRuntime(store, inference, registry, registry.getToolDefinitions());
+  const channel = new MessageChannel();
+  const host = new KernelWorkerHost(store, runtime, channel.port1);
+  const client = new VelesAppClient(channel.port2);
+  try {
+    await client.initWorkspace("Approval origin");
+    assert.equal((await client.startRun("origin-approval", "Approve", config)).runState, "awaiting_approval");
+    const approval = client.resolveApproval("origin-approval", true);
+    await entered.promise;
+    await client.switchWorkspace("approval-other", "Other");
+    release.resolve();
+    await approval;
+    await client.switchWorkspace("ws-stop");
+    assert.equal(client.getStateView().snapshot?.runState, "completed");
+    assert.equal(client.getStateView().inFlightRunId, null);
+    assert.equal((await client.startRun("origin-next", "Next", config)).activeRunId, "origin-next");
+  } finally { release.resolve(); client.dispose(); host.dispose(); channel.port1.close(); channel.port2.close(); }
+});
+
+it("cleans up Stop in its originating workspace after switching away", async (t) => {
+  const store = await fixture();
+  const entered = deferred();
+  const stopEntered = deferred();
+  const releaseStop = deferred();
+  const originalAppend = store.appendEvent.bind(store);
+  t.mock.method(store, "appendEvent", async (input: Parameters<typeof store.appendEvent>[0]) => {
+    if (input.type === "RunCancelled") { stopEntered.resolve(); await releaseStop.promise; }
+    return originalAppend(input);
+  });
+  const registry = new BrowserToolRegistry(store);
+  const runtime = new AgentKernelRuntime(store, { async *streamChat() {
+    entered.resolve(); await new Promise<void>(() => {});
+  } }, registry, registry.getToolDefinitions());
+  const channel = new MessageChannel();
+  const host = new KernelWorkerHost(store, runtime, channel.port1);
+  const client = new VelesAppClient(channel.port2);
+  try {
+    await client.initWorkspace("Stop origin");
+    const run = client.startRun("origin-stop", "Wait", config);
+    await entered.promise;
+    const stop = client.cancelRun("origin-stop");
+    await stopEntered.promise;
+    await client.switchWorkspace("stop-other", "Other");
+    releaseStop.resolve();
+    await Promise.all([run, stop]);
+    await client.switchWorkspace("ws-stop");
+    assert.equal(client.getStateView().stoppingRunId, null);
+  } finally { releaseStop.resolve(); client.dispose(); host.dispose(); channel.port1.close(); channel.port2.close(); }
+});
+
+for (const pendingAction of ["archive import", "session switch"] as const) {
+it(`pins ${pendingAction === "archive import" ? "an archive import" : "a session switch"} to its source workspace while cancellation is pending`, async (t) => {
+  const store = await fixture();
+  const running = deferred();
+  const cancelEntered = deferred();
+  const releaseCancel = deferred();
+  const registry = new BrowserToolRegistry(store);
+  const runtime = new AgentKernelRuntime(store, { async *streamChat() {
+    running.resolve(); await new Promise<void>(() => {});
+  } }, registry, registry.getToolDefinitions());
+  const originalCancel = runtime.cancelActiveRun.bind(runtime);
+  t.mock.method(runtime, "cancelActiveRun", async (runId: string) => {
+    cancelEntered.resolve(); await releaseCancel.promise;
+    return originalCancel(runId);
+  });
+  const channel = new MessageChannel();
+  const host = new KernelWorkerHost(store, runtime, channel.port1);
+  const client = new VelesAppClient(channel.port2);
+  try {
+    await client.initWorkspace("Import origin");
+    await client.uploadWorkspaceFile("notes/original.txt", "original");
+    const archive = await client.exportWorkspace();
+    await client.uploadWorkspaceFile("notes/later.txt", "later");
+    const run = client.startRun("import-old-run", "Wait", config);
+    await running.promise;
+    const importing = pendingAction === "archive import"
+      ? client.importWorkspace(archive)
+      : client.switchChatSession("origin-session");
+    await cancelEntered.promise;
+    await client.switchWorkspace("import-other", "Other");
+    await client.uploadWorkspaceFile("notes/other.txt", "other workspace");
+    releaseCancel.resolve();
+    await Promise.all([run, importing]);
+    assert.equal(client.getStateView().snapshot?.workspaceId, "import-other");
+    assert.deepEqual(client.getStateView().snapshot?.files, { "notes/other.txt": "other workspace" });
+    const original = await client.switchWorkspace("ws-stop");
+    assert.deepEqual(original.files, pendingAction === "archive import"
+      ? { "notes/original.txt": "original" }
+      : { "notes/original.txt": "original", "notes/later.txt": "later" });
+    if (pendingAction === "session switch") assert.equal(original.activeSessionId, "origin-session");
+  } finally { releaseCancel.resolve(); client.dispose(); host.dispose(); channel.port1.close(); channel.port2.close(); }
+});
+}
+
+it("retains the workspace lease until an in-flight upload settles during disposal", async (t) => {
+  const locks = new InMemoryLockProvider();
+  const backend = new InMemoryJournalBackend();
+  const blobs = new ContentAddressedBlobStore(new InMemoryBlobBackend());
+  const lease = await locks.acquireWorkspaceLease("dispose-upload", "owner");
+  const store = new WorkspaceKernelStore(backend, blobs, lease, locks);
+  await store.initWorkspace("Upload disposal");
+  const entered = deferred();
+  const release = deferred();
+  const committed = deferred();
+  const originalCommit = backend.commitAtomic.bind(backend);
+  t.mock.method(backend, "commitAtomic", async (...args: Parameters<typeof backend.commitAtomic>) => {
+    entered.resolve(); await release.promise;
+    await originalCommit(...args);
+    committed.resolve();
+  });
+  const registry = new BrowserToolRegistry(store);
+  const runtime = new AgentKernelRuntime(store, { async *streamChat() {} }, registry, registry.getToolDefinitions());
+  const channel = new MessageChannel();
+  const host = new KernelWorkerHost(store, runtime, channel.port1);
+  const client = new VelesAppClient(channel.port2);
+  try {
+    const uploading = client.uploadWorkspaceFile("notes/upload.txt", "in progress");
+    void uploading.catch(() => {});
+    await entered.promise;
+    host.dispose();
+    const observer = await locks.acquireWorkspaceLease("dispose-upload", "contender");
+    assert.equal(observer.mode, "ReadOnly_Observer", "Pending durable writes must keep their lease");
+    await observer.release();
+    release.resolve();
+    await committed.promise;
+    await new Promise<void>((done) => setImmediate(done));
+    const nextOwner = await locks.acquireWorkspaceLease("dispose-upload", "next-owner");
+    assert.equal(nextOwner.mode, "ReadWrite_Leader", "The lease must release once the write settles");
+    await nextOwner.release();
+  } finally { release.resolve(); client.dispose(); host.dispose(); channel.port1.close(); channel.port2.close(); }
+});
+
 it("restores an older archive after live commits without retaining newer files or journal rows", async () => {
   const store = await fixture();
   const registry = new BrowserToolRegistry(store);
@@ -283,16 +445,22 @@ it("restores an older archive after live commits without retaining newer files o
 });
 
 
-it("keeps a new workspace selected when an old run settles or returns late", async () => {
+it("keeps a new workspace selected while an old workspace run continues concurrently in the background", async () => {
   const store = await fixture();
   const entered = deferred();
   const release = deferred();
   const registry = new BrowserToolRegistry(store);
-  const inference: InferenceAdapter = { async *streamChat() {
-    entered.resolve(); await release.promise;
-    yield { providerId: "test", model: "fixture", deltaText: "", usage: null, finishReason: "tool_calls",
-      toolCalls: [{ id: "late-write", name: "workspace.write_file", argumentsJson: JSON.stringify({ path: "wrong-workspace.txt", content: "bad" }) }],
-    };
+  const inference: InferenceAdapter = { async *streamChat(req) {
+    const userPrompt = [...req.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const hasToolOutput = req.messages.some((m) => m.role === "tool");
+    if (userPrompt === "Wait" && !hasToolOutput) {
+      entered.resolve(); await release.promise;
+      yield { providerId: "test", model: "fixture", deltaText: "", usage: null, finishReason: "tool_calls",
+        toolCalls: [{ id: "late-write", name: "workspace.write_file", argumentsJson: JSON.stringify({ path: "old-workspace-only.txt", content: "isolated" }) }],
+      };
+      return;
+    }
+    yield { providerId: "test", model: "fixture", deltaText: `Done:${userPrompt}`, usage: null, finishReason: "stop", toolCalls: [] };
   } };
   const runtime = new AgentKernelRuntime(store, inference, registry, registry.getToolDefinitions());
   const channel = new MessageChannel();
@@ -303,16 +471,24 @@ it("keeps a new workspace selected when an old run settles or returns late", asy
     const run = client.startRun("old-workspace-run", "Wait", config);
     await entered.promise;
     const next = await bounded(client.switchWorkspace("ws-next", "Next"));
-    await bounded(run);
     assert.equal(next.workspaceId, "ws-next");
     assert.equal(client.getStateView().snapshot?.workspaceId, "ws-next");
+    assert.equal(client.getStateView().inFlightRunId, null);
+    // Start and complete a concurrent run in ws-next while old-workspace-run is still in flight in ws-stop
+    const nextDone = await bounded(client.startRun("next-workspace-run", "Concurrent", config));
+    assert.equal(nextDone.workspaceId, "ws-next");
+    assert.equal(nextDone.runState, "completed");
+    assert.deepEqual(nextDone.files, {});
+    // Now release old-workspace-run in the background and verify it writes only to ws-stop, keeping ws-next selected
     release.resolve();
-    await new Promise((done) => setTimeout(done, 10));
-    assert.deepEqual(await store.listFiles(), []);
+    const oldSettled = await bounded(run);
+    assert.equal(oldSettled.workspaceId, "ws-stop");
+    assert.equal(oldSettled.runState, "completed");
     assert.equal(client.getStateView().snapshot?.workspaceId, "ws-next");
+    assert.deepEqual(client.getStateView().snapshot?.files, {});
     const old = await client.switchWorkspace("ws-stop");
-    assert.equal(old.runState, "cancelled");
-    assert.deepEqual(old.files, {});
+    assert.equal(old.runState, "completed");
+    assert.deepEqual(old.files, { "old-workspace-only.txt": "isolated" });
   } finally { release.resolve(); client.dispose(); host.dispose(); channel.port1.close(); channel.port2.close(); }
 });
 

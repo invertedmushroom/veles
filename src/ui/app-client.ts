@@ -95,15 +95,55 @@ export class VelesAppClient {
   private snapshot: WorkspaceStateSnapshot | null = null;
   private selectedProvider: ProviderModelConfigSpec;
   private serviceConfig: ServiceCapabilitiesConfigSpec;
-  private streamingDraftText = "";
+  private readonly draftByWorkspace = new Map<string, string>();
+  private readonly inFlightByWorkspace = new Map<string, RunId>();
+  private readonly stoppingByWorkspace = new Map<string, RunId>();
+  private readonly pendingTurnByWorkspace = new Map<string, PendingUserTurn>();
   private lastError: string | null = null;
-  private inFlightRunId: RunId | null = null;
-  private stoppingRunId: RunId | null = null;
-  private pendingUserTurn: PendingUserTurn | null = null;
   private viewRevision = 0;
   private materializedHeadSeq = -1;
   private rpcCounter = 0;
   private disposed = false;
+
+  private get wsKey(): string {
+    return this.snapshot?.workspaceId ?? "__default__";
+  }
+
+  private get streamingDraftText(): string {
+    return this.draftByWorkspace.get(this.wsKey) ?? "";
+  }
+
+  private set streamingDraftText(val: string) {
+    if (val) this.draftByWorkspace.set(this.wsKey, val);
+    else this.draftByWorkspace.delete(this.wsKey);
+  }
+
+  private get inFlightRunId(): RunId | null {
+    return this.inFlightByWorkspace.get(this.wsKey) ?? null;
+  }
+
+  private set inFlightRunId(val: RunId | null) {
+    if (val) this.inFlightByWorkspace.set(this.wsKey, val);
+    else this.inFlightByWorkspace.delete(this.wsKey);
+  }
+
+  private get stoppingRunId(): RunId | null {
+    return this.stoppingByWorkspace.get(this.wsKey) ?? null;
+  }
+
+  private set stoppingRunId(val: RunId | null) {
+    if (val) this.stoppingByWorkspace.set(this.wsKey, val);
+    else this.stoppingByWorkspace.delete(this.wsKey);
+  }
+
+  private get pendingUserTurn(): PendingUserTurn | null {
+    return this.pendingTurnByWorkspace.get(this.wsKey) ?? null;
+  }
+
+  private set pendingUserTurn(val: PendingUserTurn | null) {
+    if (val) this.pendingTurnByWorkspace.set(this.wsKey, val);
+    else this.pendingTurnByWorkspace.delete(this.wsKey);
+  }
 
   constructor(
     port: WorkerPortLike,
@@ -187,31 +227,27 @@ export class VelesAppClient {
       ...config,
       decision: { ...config.decision },
     };
-    const res = await this.sendRequest({
+    return this.requestWorkspaceSnapshot({
       type: "UPDATE_SERVICE_CONFIG",
       serviceConfig: this.serviceConfig,
     });
-    return this.applySnapshotFromResponse(res);
   }
 
   public async initWorkspace(title: string): Promise<WorkspaceStateSnapshot> {
-    const res = await this.sendRequest({ type: "INIT_WORKSPACE", title });
-    return this.applySnapshotFromResponse(res);
+    return this.requestWorkspaceSnapshot({ type: "INIT_WORKSPACE", title });
   }
 
   public async refreshSnapshot(): Promise<WorkspaceStateSnapshot> {
-    const res = await this.sendRequest({ type: "GET_SNAPSHOT" });
-    return this.applySnapshotFromResponse(res);
+    return this.requestWorkspaceSnapshot({ type: "GET_SNAPSHOT" });
   }
 
   public async createSession(
     session: AgentSessionSpec,
   ): Promise<WorkspaceStateSnapshot> {
-    const res = await this.sendRequest({
+    return this.requestWorkspaceSnapshot({
       type: "CREATE_SESSION",
       session,
     });
-    return this.applySnapshotFromResponse(res);
   }
 
   public async startRun(
@@ -221,13 +257,13 @@ export class VelesAppClient {
     sessionId?: string,
   ): Promise<WorkspaceStateSnapshot> {
     if (this.inFlightRunId || isActiveRun(this.snapshot?.runState)) throw new Error("ERR_RUN_ALREADY_ACTIVE: Stop the current run before sending another message");
-    const revision = this.viewRevision;
+    const originWsKey = this.wsKey;
     const previousSnapshot = this.snapshot;
     const effectiveSessionId = sessionId ?? this.snapshot?.activeSessionId ?? "session-main";
-    this.pendingUserTurn = { runId, sessionId: effectiveSessionId, prompt, status: "sending" };
-    this.streamingDraftText = "";
+    this.pendingTurnByWorkspace.set(originWsKey, { runId, sessionId: effectiveSessionId, prompt, status: "sending" });
+    this.draftByWorkspace.delete(originWsKey);
     this.lastError = null;
-    this.inFlightRunId = runId;
+    this.inFlightByWorkspace.set(originWsKey, runId);
     if (this.snapshot) {
       this.snapshot = {
         ...this.snapshot,
@@ -252,20 +288,38 @@ export class VelesAppClient {
           decision: { ...this.serviceConfig.decision },
         },
       });
-      if (revision !== this.viewRevision) return this.snapshot!;
-      this.streamingDraftText = "";
-      this.pendingUserTurn = null;
+      this.draftByWorkspace.delete(originWsKey);
+      this.pendingTurnByWorkspace.delete(originWsKey);
+      if (this.isBackgroundWorkspaceResponse(res)) {
+        return res.snapshot!;
+      }
       return this.applySnapshotFromResponse(res);
     } catch (error) {
-      if (revision === this.viewRevision && this.pendingUserTurn?.runId === runId) {
-        this.pendingUserTurn = { ...this.pendingUserTurn, status: "failed" };
-        this.snapshot = previousSnapshot;
+      const pending = this.pendingTurnByWorkspace.get(originWsKey);
+      if (pending?.runId === runId) {
+        this.pendingTurnByWorkspace.set(originWsKey, { ...pending, status: "failed" });
+        if (this.wsKey === originWsKey) {
+          this.snapshot = previousSnapshot;
+        }
       }
       throw error;
     } finally {
-      if (this.inFlightRunId === runId) this.inFlightRunId = null;
+      if (this.inFlightByWorkspace.get(originWsKey) === runId) {
+        this.inFlightByWorkspace.delete(originWsKey);
+      }
       this.notifyListeners();
     }
+  }
+
+  private isBackgroundWorkspaceResponse(
+    res: Extract<WorkerToUiMessage, { kind: "RESPONSE" }>,
+  ): boolean {
+    if (!this.snapshot || !res.snapshot) return false;
+    if (this.snapshot.workspaceId === res.snapshot.workspaceId) return false;
+    if (res.snapshot.workspaces) {
+      this.snapshot = { ...this.snapshot, workspaces: res.snapshot.workspaces };
+    }
+    return true;
   }
 
   public async switchChatSession(
@@ -276,26 +330,29 @@ export class VelesAppClient {
     this.pendingUserTurn = null;
     this.streamingDraftText = "";
     this.lastError = null;
-    const res = await this.sendRequest({
+    return this.requestWorkspaceSnapshot({
       type: "SWITCH_SESSION",
       sessionId,
       title,
     });
-    return this.applySnapshotFromResponse(res);
   }
 
-  public async deleteChatRun(runId: RunId): Promise<WorkspaceStateSnapshot> {
+  public async deleteChatRun(
+    runId: RunId,
+    options?: { readonly revertFiles?: boolean },
+  ): Promise<WorkspaceStateSnapshot> {
     this.streamingDraftText = "";
     this.lastError = null;
-    const res = await this.sendRequest({
+    return this.requestWorkspaceSnapshot({
       type: "DELETE_RUN",
       runId,
+      ...(options?.revertFiles ? { revertFiles: true } : {}),
     });
-    return this.applySnapshotFromResponse(res);
   }
 
   public async cancelRun(runId: RunId): Promise<WorkspaceStateSnapshot> {
     const revision = this.viewRevision;
+    const originWsKey = this.wsKey;
     this.stoppingRunId = runId;
     this.streamingDraftText = "";
     this.notifyListeners();
@@ -304,7 +361,9 @@ export class VelesAppClient {
       if (revision !== this.viewRevision) return this.snapshot!;
       return this.applySnapshotFromResponse(res);
     } finally {
-      if (this.stoppingRunId === runId) this.stoppingRunId = null;
+      if (this.stoppingByWorkspace.get(originWsKey) === runId) {
+        this.stoppingByWorkspace.delete(originWsKey);
+      }
       this.notifyListeners();
     }
   }
@@ -314,6 +373,7 @@ export class VelesAppClient {
     approved: boolean,
   ): Promise<WorkspaceStateSnapshot> {
     const revision = this.viewRevision;
+    const originWsKey = this.wsKey;
     this.lastError = null;
     this.inFlightRunId = runId;
     if (this.snapshot) {
@@ -330,12 +390,12 @@ export class VelesAppClient {
         runId,
         approved,
       });
-      this.streamingDraftText = "";
+      this.draftByWorkspace.delete(originWsKey);
       if (revision !== this.viewRevision) return this.snapshot!;
       return this.applySnapshotFromResponse(res);
     } finally {
-      if (this.inFlightRunId === runId) {
-        this.inFlightRunId = null;
+      if (this.inFlightByWorkspace.get(originWsKey) === runId) {
+        this.inFlightByWorkspace.delete(originWsKey);
       }
       this.notifyListeners();
     }
@@ -346,6 +406,7 @@ export class VelesAppClient {
     resolution: "mark_succeeded" | "retry_anyway" | "cancel_run",
   ): Promise<WorkspaceStateSnapshot> {
     const revision = this.viewRevision;
+    const originWsKey = this.wsKey;
     this.lastError = null;
     this.inFlightRunId = runId;
     if (this.snapshot) {
@@ -362,12 +423,12 @@ export class VelesAppClient {
         runId,
         resolution,
       });
-      this.streamingDraftText = "";
+      this.draftByWorkspace.delete(originWsKey);
       if (revision !== this.viewRevision) return this.snapshot!;
       return this.applySnapshotFromResponse(res);
     } finally {
-      if (this.inFlightRunId === runId) {
-        this.inFlightRunId = null;
+      if (this.inFlightByWorkspace.get(originWsKey) === runId) {
+        this.inFlightByWorkspace.delete(originWsKey);
       }
       this.notifyListeners();
     }
@@ -417,9 +478,12 @@ export class VelesAppClient {
 
   public async importWorkspace(bundle: unknown): Promise<WorkspaceStateSnapshot> {
     this.viewRevision += 1;
+    const revision = this.viewRevision;
+    const originWsKey = this.wsKey;
     this.pendingUserTurn = null;
     this.streamingDraftText = "";
     const res = await this.sendRequest({ type: "IMPORT_BUNDLE", bundle });
+    if (revision !== this.viewRevision || originWsKey !== this.wsKey) return res.snapshot!;
     // An explicit restore can intentionally replace this workspace with an older journal.
     this.materializedHeadSeq = -1;
     this.snapshot = null;
@@ -431,8 +495,6 @@ export class VelesAppClient {
     title?: string,
   ): Promise<WorkspaceStateSnapshot> {
     this.viewRevision += 1;
-    this.pendingUserTurn = null;
-    this.streamingDraftText = "";
     this.lastError = null;
     const res = await this.sendRequest({
       type: "SWITCH_WORKSPACE",
@@ -446,8 +508,10 @@ export class VelesAppClient {
     workspaceId: string,
   ): Promise<WorkspaceStateSnapshot> {
     this.viewRevision += 1;
-    this.pendingUserTurn = null;
-    this.streamingDraftText = "";
+    this.draftByWorkspace.delete(workspaceId);
+    this.inFlightByWorkspace.delete(workspaceId);
+    this.stoppingByWorkspace.delete(workspaceId);
+    this.pendingTurnByWorkspace.delete(workspaceId);
     this.lastError = null;
     const res = await this.sendRequest({
       type: "DELETE_WORKSPACE",
@@ -460,12 +524,11 @@ export class VelesAppClient {
     path: string,
     content: string | Uint8Array,
   ): Promise<WorkspaceStateSnapshot> {
-    const res = await this.sendRequest({
+    return this.requestWorkspaceSnapshot({
       type: "WRITE_WORKSPACE_FILE",
       path,
       content,
     });
-    return this.applySnapshotFromResponse(res);
   }
 
   /**
@@ -501,6 +564,15 @@ export class VelesAppClient {
       workspaceSeq: this.snapshot.headSeq,
       files,
     });
+  }
+
+  private async requestWorkspaceSnapshot(request: UiToWorkerRequestPayload): Promise<WorkspaceStateSnapshot> {
+    const originWsKey = this.wsKey;
+    const revision = this.viewRevision;
+    const response = await this.sendRequest(request);
+    if (!response.snapshot) throw new Error("ERR_MISSING_SNAPSHOT_IN_WORKER_RESPONSE");
+    if (originWsKey !== this.wsKey || revision !== this.viewRevision) return response.snapshot;
+    return this.applySnapshotFromResponse(response);
   }
 
   private applySnapshotFromResponse(
@@ -596,12 +668,32 @@ export class VelesAppClient {
   }
 
   private applyCommittedRecord(record: RunJournalRecord): void {
+    if (
+      record.type === "RunCreated" &&
+      this.pendingTurnByWorkspace.get(record.workspaceId)?.runId === record.runId
+    ) {
+      this.pendingTurnByWorkspace.delete(record.workspaceId);
+    }
+    if (
+      [
+        "ToolIntentLogged",
+        "ApprovalRequested",
+        "RunCompleted",
+        "RunCancelled",
+        "RunInterrupted",
+      ].includes(record.type)
+    ) {
+      this.draftByWorkspace.delete(record.workspaceId);
+    }
     const snap = this.snapshot;
-    if (!snap || record.workspaceId !== snap.workspaceId || record.seq <= snap.headSeq) return;
+    if (!snap) return;
+    if (record.workspaceId !== snap.workspaceId) {
+      this.updateBackgroundWorkspaceSummary(snap, record);
+      return;
+    }
+    if (record.seq <= snap.headSeq) return;
     const targetRunId = this.inFlightRunId ?? snap.activeRunId;
     const isCurrent = record.runId === targetRunId;
-    if (record.type === "RunCreated" && this.pendingUserTurn?.runId === record.runId) this.pendingUserTurn = null;
-    if (isCurrent && ["ToolIntentLogged", "ApprovalRequested", "RunCompleted", "RunCancelled", "RunInterrupted"].includes(record.type)) this.streamingDraftText = "";
     const reason = record.payload.interruptReason;
     const interruptReason = reason === "uncertain_tool_outcome" || reason === "user_reload_or_tab_close" || reason === "gateway_disconnected_safe_to_retry" ? reason : null;
     this.snapshot = {
@@ -610,6 +702,28 @@ export class VelesAppClient {
         runState: record.committedState, interruptReason,
         ...(record.committedState !== "awaiting_approval" ? { pendingApproval: null } : {}),
       } : {}),
+    };
+  }
+
+  private updateBackgroundWorkspaceSummary(
+    snap: WorkspaceStateSnapshot,
+    record: RunJournalRecord,
+  ): void {
+    if (!snap.workspaces?.some((w) => w.workspaceId === record.workspaceId)) {
+      return;
+    }
+    this.snapshot = {
+      ...snap,
+      workspaces: snap.workspaces.map((w) =>
+        w.workspaceId === record.workspaceId
+          ? {
+              ...w,
+              headSeq: Math.max(w.headSeq, record.seq),
+              updatedAtMs: record.timestampMs,
+              runState: record.committedState,
+            }
+          : w,
+      ),
     };
   }
 

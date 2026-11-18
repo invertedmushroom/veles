@@ -273,7 +273,7 @@ export async function bootBrowserKernelWorker(
 
   let runtimeRef: AgentKernelRuntime | undefined;
   const workspaceTools = createDefaultWorkspaceTools(
-    () => runtimeRef?.getLatestModelConfig(),
+    (runId) => runtimeRef?.getLatestModelConfig(runId),
     () => runtimeRef?.getServiceConfig(),
   );
   const tools = new BrowserToolRegistry(store, workspaceTools, gatewayFallback);
@@ -301,7 +301,9 @@ export async function bootBrowserKernelWorker(
     })
     .catch(() => {});
 
-  return new KernelWorkerHost(store, runtime, port, agentManager);
+  return new KernelWorkerHost(
+    store, runtime, port, agentManager, createDefaultWorkspaceTools,
+  );
 }
 
 // Auto-boot when loaded as a browser DedicatedWorkerGlobalScope

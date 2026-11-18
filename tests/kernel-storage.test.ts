@@ -29,6 +29,34 @@ import {
 } from "../src/kernel/opfs-blobs.ts";
 
 describe("SYS-KERNEL Workspace Storage (IndexedDB, OPFS & Scenarios 5, 6, 7)", () => {
+  it("rejects released leases and requires the target workspace's own authority", async () => {
+    const locks = new InMemoryLockProvider();
+    const backend = new InMemoryJournalBackend();
+    const blobs = new ContentAddressedBlobStore(new InMemoryBlobBackend());
+    const lease = await locks.acquireWorkspaceLease("released-a", "first-tab");
+    const store = new WorkspaceKernelStore(backend, blobs, lease, locks);
+    await store.initWorkspace("A");
+    const other = await store.forkForWorkspace("released-b", "B");
+    const withoutProvider = new WorkspaceKernelStore(backend, blobs, lease);
+    await assert.rejects(withoutProvider.forkForWorkspace("released-b"), /ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED/);
+    await assert.rejects(withoutProvider.switchWorkspace("released-b"), /ERR_WORKSPACE_LOCK_PROVIDER_REQUIRED/);
+    assert.equal(withoutProvider.getActiveWorkspaceId(), "released-a");
+    await assert.rejects(store.deleteWorkspaceStorage("released-b"), /ERR_WORKSPACE_AUTHORITY_MISMATCH/);
+    await assert.rejects(store.deleteWorkspace("released-b"), /ERR_WORKSPACE_AUTHORITY_MISMATCH/);
+    await store.releaseWorkspaceLease();
+    assert.equal(store.getLeaseMode(), "ReadOnly_Observer");
+    const secondLease = await locks.acquireWorkspaceLease("released-a", "second-tab");
+    try {
+      await assert.rejects(store.writeWorkspaceFile("leak.txt", "stale owner"), /ERR_WORKSPACE_LOCKED_BY_OTHER_TAB/);
+      const third = await store.forkForWorkspace("released-c", "C");
+      await third.writeWorkspaceFile("ok.txt", "independent lease");
+      await third.releaseWorkspaceLease();
+    } finally {
+      await secondLease.release();
+      await other.releaseWorkspaceLease();
+    }
+  });
+
   it("persists workspace files and monotonic journal across simulated browser reload", async () => {
     const locks = new InMemoryLockProvider();
     const journalBackend = new InMemoryJournalBackend();

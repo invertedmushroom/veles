@@ -54,10 +54,20 @@ test("executes local calculations while CSP blocks a scanner-obfuscated module r
     code: 'writeFile("notes/result.txt", "42"); return { sum: 20 + 22, fetch: typeof fetch, indexedDB: typeof indexedDB };',
   });
   expect(calculation.error).toBeNull();
-  expect(JSON.parse(calculation.outputText!)).toEqual({ sum: 42, fetch: "undefined", indexedDB: "undefined" });
+  const expectedResult = JSON.stringify({ sum: 42, fetch: "undefined", indexedDB: "undefined" }, null, 2);
+  expect(calculation.outputText).toBe(`${expectedResult}\nWrote 'notes/result.txt' (2 chars). Preview: 42`);
   const blocked = await executeBrowserTool(page, "workspace.run_script", { code: maskedImport });
   expect(blocked.error).toMatch(/Failed to fetch dynamically imported module|ERR_SCRIPT_SANDBOX/);
   expect(requests).toBe(0);
+});
+
+test("preserves caught error details from the protected script worker", async ({ page }) => {
+  await openToolFixture(page);
+  const result = await executeBrowserTool(page, "workspace.run_script", {
+    code: "try { tools.workspace.read_file({ path: 'notes/marker.txt' }); } catch (error) { console.error('Error reading file:', error); }",
+  });
+  expect(result.error).toBeNull();
+  expect(result.outputText).toMatch(/Error reading file: TypeError: .*read_file.*not a function/);
 });
 
 test("rejects an unavailable protected worker without creating a blob fallback", async ({ page }) => {
@@ -90,6 +100,10 @@ test("requires a validating fetch proxy and distinguishes missing service from u
     expect(result.error).toContain("ERR_FETCH_PROXY_UNAVAILABLE");
     await page.context().unroute(proxyRoute);
   }
+  await page.context().route(proxyRoute, (route) => route.abort());
+  const offlineProxy = await executeBrowserTool(page, "web.fetch_url", { url: "http://public-review.test/private" });
+  expect(offlineProxy.error).toContain("ERR_FETCH_PROXY_UNAVAILABLE");
+  await page.context().unroute(proxyRoute);
   await page.context().route(proxyRoute, (route) => route.fulfill({
     status: 404, body: "upstream missing", headers: { "X-Veles-Fetch-Proxy": "1" },
   }));
@@ -101,6 +115,11 @@ test("requires a validating fetch proxy and distinguishes missing service from u
   }));
   const valid = await executeBrowserTool(page, "web.fetch_url", { url: "http://public-review.test/data.csv" });
   expect(valid).toEqual({ outputText: "x,y\n1,2", error: null });
+  const codeModeFetch = await executeBrowserTool(page, "workspace.run_script", {
+    code: 'await tools.web.fetchUrl("http://public-review.test/data.csv", "assets/data.csv"); return readFile("assets/data.csv");',
+  });
+  expect(codeModeFetch.error).toBeNull();
+  expect(codeModeFetch.outputText).toContain("Wrote 'assets/data.csv'");
   expect(directRequests).toBe(0);
   await page.context().unroute(proxyRoute);
   const denied = await page.request.get("/api/proxy/fetch?url=http%3A%2F%2F127.0.0.1%2Fprivate");

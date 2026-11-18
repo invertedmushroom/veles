@@ -14,7 +14,14 @@ wheels/
 .env.*
 !.env.example
 
+# Rebuildable code-review-graph index and generated artifacts
+.code-review-graph/
+
+# Rebuildable evaluation traces and live hook logs
+.autoresearch/traces/
+.autoresearch/runner.local.json
+
 node_modules/
-*.tsbuildinfo
-test-results/
-playwright-report/
+
+.context/explorations/*
+.certs/

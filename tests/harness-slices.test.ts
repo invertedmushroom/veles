@@ -26,12 +26,18 @@ import { AgentKernelRuntime, ContextBuilder } from "../src/kernel/runtime.ts";
 import {
     BrowserToolRegistry,
     createDefaultWorkspaceTools,
+    createOpenAIImageProvider,
     createSubagentTools,
     isBlockedPrivateHost,
     normalizePublicFetchUrl,
 } from "../src/kernel/tools.ts";
 import { KernelWorkerHost } from "../src/kernel/worker-host.ts";
+import {
+    summarizeWorkspaceFileSignature,
+    verifyWorkspaceFilePreflight,
+} from "../src/kernel/workspace-intelligence.ts";
 import type {
+    RunJournalRecord,
     ServiceCapabilitiesConfigSpec,
     WorkerPortLike,
 } from "../src/protocol/types.ts";
@@ -68,7 +74,331 @@ async function createSliceWorkspace(id = "ws-slice") {
     return { store, journalBackend, blobBackend };
 }
 
+async function commitWorkspaceToolRun(
+    store: WorkspaceKernelStore,
+    runId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+) {
+    const tools = new BrowserToolRegistry(store);
+    let round = 0;
+    const runtime = new AgentKernelRuntime(store, {
+        async *streamChat(req) {
+            round += 1;
+            yield {
+                providerId: req.config.providerId, model: req.config.model,
+                deltaText: "", usage: null, finishReason: round === 1 ? "tool_calls" : "stop",
+                toolCalls: round === 1 ? [{ id: `${runId}-call`, name: toolName, argumentsJson: JSON.stringify(args) }] : [],
+            };
+        },
+    }, tools, tools.getToolDefinitions());
+    await runtime.startRun(runId, toolName, TEST_CONFIG);
+}
+
 describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Specialist Router, & Fenced Preview)", () => {
+    it("allows repair rereads after the target changes while guarding unchanged duplicate reads", async () => {
+        const { store } = await createSliceWorkspace("ws-repair-reread");
+        await store.writeWorkspaceFile("preview/a.txt", "A");
+        const tools = new BrowserToolRegistry(store);
+        const read = { name: "workspace.read_file", argumentsJson: JSON.stringify({ path: "preview/a.txt" }) };
+        const write = (path: string, content: string) => ({ name: "workspace.write_file", argumentsJson: JSON.stringify({ path, content }) });
+        const calls = [read, write("notes/unrelated.txt", "irrelevant"), read, write("preview/a.txt", "B"), read, write("preview/a.txt", "A"), read, read];
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? calls.map((call, i) => ({ ...call, id: `repair-${i}` })) : [],
+                };
+            },
+        }, tools, tools.getToolDefinitions());
+        assert.equal(await runtime.startRun("repair-read", "Read, edit, and verify", TEST_CONFIG), "completed");
+        const results = (await store.getJournal()).filter((record) => record.type === "ToolResultCommitted" && record.payload.toolName === "workspace.read_file");
+        assert.equal(results[0]!.payload.outputText, "A");
+        assert.match(String(results[1]!.payload.outputText), /LOOP_GUARD_TRIGGERED/);
+        assert.equal(results[2]!.payload.outputText, "B", "A changed target must be readable for repair verification");
+        assert.equal(results[3]!.payload.outputText, "A", "Returning to a prior version must reset the consecutive-read guard");
+        assert.match(String(results[4]!.payload.outputText), /LOOP_GUARD_TRIGGERED/);
+    });
+
+    it("allows listing a changed file tree while guarding an unchanged duplicate listing", async () => {
+        const { store } = await createSliceWorkspace("ws-repair-list");
+        const tools = new BrowserToolRegistry(store);
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? [
+                        { id: "list-before", name: "workspace.list_files", argumentsJson: "{}" },
+                        { id: "new-file", name: "workspace.write_file", argumentsJson: JSON.stringify({ path: "notes/new.txt", content: "new" }) },
+                        { id: "list-after", name: "workspace.list_files", argumentsJson: "{}" },
+                        { id: "list-duplicate", name: "workspace.list_files", argumentsJson: "{}" },
+                    ] : [],
+                };
+            },
+        }, tools, tools.getToolDefinitions());
+        await runtime.startRun("repair-list", "Verify the new file", TEST_CONFIG);
+        const results = (await store.getJournal()).filter((record) => record.type === "ToolResultCommitted" && record.payload.toolName === "workspace.list_files");
+        assert.match(String(results[1]!.payload.outputText), /notes\/new\.txt/);
+        assert.doesNotMatch(String(results[1]!.payload.outputText), /LOOP_GUARD_TRIGGERED/);
+        assert.match(String(results[2]!.payload.outputText), /LOOP_GUARD_TRIGGERED/);
+    });
+
+    it("preserves caught sandbox error names and messages in console output", async () => {
+        const { store } = await createSliceWorkspace("ws-script-error-output");
+        const tools = new BrowserToolRegistry(store);
+        const outcome = await tools.executeTool({
+            runId: "script-error", operationId: "script-error-log", toolName: "workspace.run_script", effectClass: "idempotent_write",
+            args: { code: "try { tools.workspace.read_file({ path: 'preview/script.js' }); } catch (error) { console.error('Error reading file:', error); } console.log({ ordinary: true });" },
+        });
+        assert.match(outcome.outputText, /Error reading file: TypeError: .*read_file.*not a function/);
+        assert.match(outcome.outputText, /\{"ordinary":true\}/);
+    });
+
+    it("keeps workspace-read dispatch available when loop-guard metadata is unavailable", async (t) => {
+        const { store } = await createSliceWorkspace("ws-read-guard-metadata");
+        const originalTree = store.getFileTree.bind(store);
+        let toolRound = false;
+        let dispatched = false;
+        t.mock.method(store, "getFileTree", async () => {
+            if (toolRound && !dispatched) throw new Error("temporary guard metadata failure");
+            return originalTree();
+        });
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                toolRound = true;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? [{ id: "read", name: "workspace.read_file", argumentsJson: '{"path":"notes/a.txt"}' }] : [],
+                };
+            },
+        }, {
+            currentGatewayInstanceId: "test",
+            async executeTool() { dispatched = true; return { outputText: "read result", gatewayInstanceId: "test" }; },
+        }, [{ name: "workspace.read_file", description: "Fixture read", effectClass: "pure_read" }]);
+        assert.equal(await runtime.startRun("metadata-read", "Read", TEST_CONFIG), "completed");
+        assert.equal(dispatched, true);
+    });
+
+    it("scopes curated tool call IDs to their originating run", () => {
+        const record = (seq: number, runId: string, type: RunJournalRecord["type"], payload: Record<string, unknown>): RunJournalRecord => ({
+            eventId: `curation-${seq}`, workspaceId: "ws-curation", runId, seq, type, payload,
+            schemaVersion: 1, timestampMs: seq, relatedOperationId: null, committedState: "inferring",
+        });
+        const records = [
+            record(1, "old", "RunCreated", { prompt: "Inspect old" }),
+            record(2, "old", "ToolIntentLogged", { toolCallId: "call_1", toolName: "workspace.read_file", args: { path: "preview/a.js" } }),
+            record(3, "old", "ToolResultCommitted", { toolCallId: "call_1", outputText: `OLD:${"x".repeat(1200)}` }),
+            record(4, "new", "RunCreated", { prompt: "Inspect current" }),
+            record(5, "new", "ToolIntentLogged", { toolCallId: "call_1", toolName: "workspace.read_file", args: { path: "preview/a.js" } }),
+            record(6, "new", "ToolResultCommitted", { toolCallId: "call_1", outputText: `NEW:${"y".repeat(1200)}` }),
+        ];
+        const tools = ContextBuilder.buildMessages(records, { hotRunWindow: 2 }).filter((m) => m.role === "tool");
+        assert.match(tools[0]!.content, /\[folded/);
+        assert.equal(tools[1]!.content, records[5]!.payload.outputText);
+        const sameRun = records.filter((record) => record.seq !== 4).map((record) => ({
+            ...record,
+            runId: "single-run",
+            relatedOperationId: record.type === "RunCreated" ? null : record.seq < 4 ? "first-op" : "second-op",
+        }));
+        const sameRunTools = ContextBuilder.buildMessages(sameRun).filter((message) => message.role === "tool");
+        assert.match(sameRunTools[0]!.content, /\[folded/);
+        assert.equal(sameRunTools[1]!.content, records[5]!.payload.outputText);
+    });
+
+    it("does not resolve a tool error with an uncommitted retry", () => {
+        const record = (seq: number, runId: string, type: RunJournalRecord["type"], payload: Record<string, unknown>): RunJournalRecord => ({
+            eventId: `retry-${seq}`, workspaceId: "ws-curation-retry", runId, seq, type, payload,
+            schemaVersion: 1, timestampMs: seq, relatedOperationId: null, committedState: "inferring",
+        });
+        const error = `ToolError (workspace.edit_file): ${"target missing ".repeat(30)}`;
+        const records = [
+            record(1, "old", "RunCreated", { prompt: "Fix" }),
+            record(2, "old", "ToolIntentLogged", { toolCallId: "error", toolName: "workspace.edit_file", args: { path: "preview/a.js" } }),
+            record(3, "old", "ToolResultCommitted", { toolCallId: "error", outputText: error }),
+            record(4, "retry", "RunCreated", { prompt: "Retry" }),
+            record(5, "retry", "ToolIntentLogged", { toolCallId: "pending", toolName: "workspace.edit_file", args: { path: "preview/a.js" } }),
+            record(6, "retry", "RunInterrupted", { interruptReason: "user_reload_or_tab_close" }),
+            record(7, "current", "RunCreated", { prompt: "Continue" }),
+        ];
+        const result = ContextBuilder.buildMessages(records, { hotRunWindow: 3 }).find((m) => m.role === "tool" && m.toolCallId === "error");
+        assert.equal(result?.content, error);
+    });
+
+    it("preserves significant literal whitespace when matching collapsed file edits", async () => {
+        const { store } = await createSliceWorkspace("ws-literal-edits");
+        const tools = new BrowserToolRegistry(store);
+        for (const literal of ['"red  blue"', "'red  blue'", "`red  blue`", "/red  blue/"]) {
+            const original = `const label = ${literal};\nconst count = 1;\n`;
+            await store.writeWorkspaceFile("preview/a.js", original);
+            await assert.rejects(tools.executeTool({
+                runId: "literal", operationId: "literal-edit", toolName: "workspace.edit_file", effectClass: "idempotent_write",
+                args: { path: "preview/a.js", target: `const label = ${literal.replace("  ", " ")}; const count = 1;`, replacement: "const count = 2;" },
+            }), /ERR_EDIT_TARGET_NOT_FOUND/);
+            assert.equal(await store.readFileText("preview/a.js"), original);
+        }
+    });
+
+    it("retains file history from conversation-only deleted turns when reverting a later edit", async () => {
+        const { store } = await createSliceWorkspace("ws-revert-deleted-conversation");
+        const path = "preview/app.js";
+        await store.writeWorkspaceFile(path, "baseline");
+        await commitWorkspaceToolRun(store, "first-edit", "workspace.write_file", { path, content: "first edit" });
+        await commitWorkspaceToolRun(store, "second-edit", "workspace.write_file", { path, content: "second edit" });
+        await store.deleteRun("first-edit");
+        assert.equal(await store.readFileText(path), "second edit");
+        await store.deleteRun("second-edit", { revertFiles: true });
+        assert.equal(await store.readFileText(path), "first edit");
+    });
+
+    it("rejects unsafe historical paths before publishing a reverted manifest", async () => {
+        const { store } = await createSliceWorkspace("ws-revert-paths");
+        const path = "notes/safe.txt";
+        await store.writeWorkspaceFile(path, "owned baseline");
+        const baselineHash = (await store.getFileTree())[path]!;
+        await commitWorkspaceToolRun(store, "path-edit", "workspace.write_file", { path, content: "changed" });
+        const archive = await store.exportWorkspaceBundle();
+        const journal = archive.journal.map((record) => {
+            if (record.runId !== "path-edit") return record;
+            if (record.type === "RunCreated") return { ...record, payload: {
+                ...record.payload,
+                preRunFileTree: { ...(record.payload.preRunFileTree as Record<string, string>), "../escape.txt": baselineHash },
+            } };
+            if (record.type === "ToolResultCommitted") return { ...record, payload: {
+                ...record.payload, observedFileHashes: { "../escape.txt": baselineHash },
+            } };
+            return record;
+        });
+        await store.importWorkspaceBundle({ ...archive, journal });
+        const before = await store.exportWorkspaceBundle();
+        await assert.rejects(store.deleteRun("path-edit", { revertFiles: true }), /ERR_UNSAFE_FILE_PATH/);
+        assert.deepEqual(await store.getFileTree(), before.fileTree);
+        assert.equal((await store.getMetadata())!.headSeq, before.metadata.headSeq);
+    });
+
+    it("uses read observations to restore legacy archives without pre-turn file snapshots", async () => {
+        const { store } = await createSliceWorkspace("ws-revert-legacy-read");
+        const path = "preview/app.js";
+        await store.writeWorkspaceFile(path, "legacy baseline");
+        await commitWorkspaceToolRun(store, "legacy-read", "workspace.read_file", { path });
+        await commitWorkspaceToolRun(store, "legacy-write", "workspace.write_file", { path, content: "legacy edit" });
+        const bundle = await store.exportWorkspaceBundle();
+        const journal = bundle.journal
+            .filter((record) => typeof record.payload.uploadedPath !== "string")
+            .map((record, index) => {
+                const { preRunFileTree: _snapshot, ...payload } = record.payload;
+                return { ...record, seq: index + 1, payload };
+            });
+        await store.importWorkspaceBundle({ ...bundle, journal, metadata: { ...bundle.metadata, headSeq: journal.length } });
+        await store.deleteRun("legacy-write", { revertFiles: true });
+        assert.equal(await store.readFileText(path), "legacy baseline");
+    });
+
+    it("exports the owned historical blobs required to revert after a fresh archive import", async () => {
+        const { store } = await createSliceWorkspace("ws-revert-fresh-archive");
+        const path = "preview/app.js";
+        await store.writeWorkspaceFile(path, "archived baseline");
+        await commitWorkspaceToolRun(store, "archived-edit", "workspace.write_file", { path, content: "archived edit" });
+        const bundle = await store.exportWorkspaceBundle();
+        const { store: freshStore } = await createSliceWorkspace("ws-revert-fresh-archive");
+        await freshStore.importWorkspaceBundle(bundle);
+        await freshStore.deleteRun("archived-edit", { revertFiles: true });
+        assert.equal(await freshStore.readFileText(path), "archived baseline");
+    });
+
+    it("rejects imported revert hashes belonging to another workspace without changing committed state", async () => {
+        const { store } = await createSliceWorkspace("ws-revert-public");
+        const privateStore = await store.forkForWorkspace("ws-revert-private", "Private");
+        await privateStore.writeWorkspaceFile("notes/private.txt", "private workspace content");
+        const privateHash = (await privateStore.getFileTree())["notes/private.txt"]!;
+        const path = "preview/app.js";
+        await store.writeWorkspaceFile(path, "public baseline");
+        await commitWorkspaceToolRun(store, "public-edit", "workspace.write_file", { path, content: "public edit" });
+        const bundle = await store.exportWorkspaceBundle();
+        const journal = bundle.journal.map((record) => record.runId === "public-edit" && record.type === "RunCreated"
+            ? { ...record, payload: { ...record.payload, preRunFileTree: { [path]: privateHash } } }
+            : record);
+        await store.importWorkspaceBundle({
+            ...bundle, journal,
+            metadata: { ...bundle.metadata, historyBlobHashes: [privateHash] },
+        });
+        const before = await store.getMetadata();
+        await assert.rejects(store.deleteRun("public-edit", { revertFiles: true }), /ERR_REVERT_BLOB_UNAVAILABLE/);
+        assert.deepEqual(await store.getMetadata(), before);
+        assert.equal(await store.readFileText(path), "public edit");
+        assert.equal((await store.getJournal()).length, bundle.journal.length);
+        const exported = await store.exportWorkspaceBundle();
+        assert.equal(exported.blobsBase64[privateHash], undefined);
+    });
+
+    it("includes GIF source images in direct Responses edit requests", async (t) => {
+        const calls: Array<Record<string, unknown>> = [];
+        t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+            calls.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+            return Response.json({ output: [{ type: "image_generation_call", result: "AA==" }] });
+        });
+        const provider = createOpenAIImageProvider(() => ({ ...TEST_CONFIG, apiKey: "test-key" }));
+        const sourceDataUrl = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+        await provider.generateOrTransform({ prompt: "make the subject blue", sourceDataUrl });
+        assert.ok(Array.isArray(calls[0]!.input), "An edit request must include its source, not just a text prompt");
+        assert.ok(JSON.stringify(calls[0]!.input).includes(sourceDataUrl));
+    });
+
+    it("keeps SVG source context when raster edit input cannot attach the original", async (t) => {
+        const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+        t.mock.method(globalThis, "fetch", async (url: unknown, init?: RequestInit) => {
+            const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+            requests.push({ url: String(url), body });
+            if (String(url).endsWith("/chat/completions")) {
+                return Response.json({ choices: [{ message: { content: "A detailed description preserving the source circle." } }] });
+            }
+            return String(url).endsWith("/responses")
+                ? Response.json({ output: [{ type: "image_generation_call", result: "AA==" }] })
+                : Response.json({ data: [{ b64_json: "AA==" }] });
+        });
+        const provider = createOpenAIImageProvider(() => ({ ...TEST_CONFIG, apiKey: "test-key" }));
+        const source = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="42"/></svg>';
+        await provider.generateOrTransform({ prompt: "make the circle blue", sourceDataUrl: `data:image/svg+xml;utf8,${encodeURIComponent(source)}` });
+        assert.ok(requests.some((request) => JSON.stringify(request.body).includes("[Source SVG]") && JSON.stringify(request.body).includes("circle")), "A source-aware fallback must inspect the original SVG");
+        assert.ok(requests.every((request) => !request.url.endsWith("/responses")), "Do not label a source-free generation as an edit");
+    });
+
+    it("continues to raster fallback when the direct edit endpoint is unavailable", async (t) => {
+        t.mock.method(globalThis, "fetch", async (url: unknown) => {
+            if (String(url).endsWith("/responses")) throw new TypeError("Failed to fetch");
+            if (String(url).endsWith("/chat/completions")) {
+                return Response.json({ choices: [{ message: { content: "Preserve the source subject and make it blue." } }] });
+            }
+            return Response.json({ data: [{ b64_json: "AA==" }] });
+        });
+        const provider = createOpenAIImageProvider(
+            () => ({ ...TEST_CONFIG, apiKey: "test-key" }), undefined, () => "openai-dalle3",
+        );
+        const result = await provider.generateOrTransform({ prompt: "make it blue", sourceDataUrl: "data:image/png;base64,AA==" });
+        assert.match(result.diagnostics ?? "", /openai:dall-e-3/);
+    });
+
+    it("does not enter image fallback after cancellation", async (t) => {
+        const controller = new AbortController();
+        const fetch = t.mock.method(globalThis, "fetch", async () => {
+            controller.abort();
+            throw controller.signal.reason;
+        });
+        const provider = createOpenAIImageProvider(() => ({ ...TEST_CONFIG, apiKey: "test-key" }));
+        await assert.rejects(provider.generateOrTransform({
+            prompt: "make it blue", sourceDataUrl: "data:image/png;base64,AA==", signal: controller.signal,
+        }), { name: "AbortError" });
+        assert.equal(fetch.mock.callCount(), 1);
+    });
+
     it("executes multiple toolCalls in a single assistant turn and pauses/resumes cleanly if a mid-batch call requires approval", async () => {
         const { store } = await createSliceWorkspace("ws-batch-tools");
         await store.writeWorkspaceFile("obsolete.txt", "delete me");
@@ -308,6 +638,144 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
         }
     });
 
+    it("retries an initial routing timeout once before caching the recovered route", async () => {
+        const { store } = await createSliceWorkspace("ws-route-recover");
+        let classified = 0;
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round < 3 ? "tool_calls" : "stop",
+                    toolCalls: round < 3 ? [{ id: `route-${round}`, name: "noop", argumentsJson: JSON.stringify({ round }) }] : [],
+                };
+            },
+        }, { currentGatewayInstanceId: "test", async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; } },
+        [{ name: "noop", description: "Keep paths unchanged", effectClass: "pure_read" }], {
+            multiTurnWorkspaceContext: true,
+            classifier: async () => {
+                classified += 1;
+                if (classified === 1) return new Promise(() => {});
+                return { status: "matched", specialistIds: ["svg-multimodal-designer"] };
+            },
+        });
+        const config = runtime.getServiceConfig();
+        runtime.setServiceConfig({ ...config, decision: { ...config.decision, timeoutMs: 10 } });
+        await runtime.startRun("route-recover", "Create an editable SVG", TEST_CONFIG);
+        assert.equal(classified, 2);
+        const routes = (await store.getJournal()).filter((r) => r.payload.harnessRouting).map((r) => r.payload.harnessRouting as Record<string, unknown>);
+        assert.equal(routes[0]!.fallbackReason, "timeout");
+        assert.deepEqual(routes.map((route) => route.source), ["tier0_deterministic", "tier1_classifier", "tier1_classifier"]);
+        assert.deepEqual(routes.map((route) => route.cacheHit), [false, false, true]);
+        assert.deepEqual(routes.map((route) => route.attemptCount), [1, 2, 2]);
+    });
+
+    it("bounds repeated routing timeouts to two attempts for an unchanged context", async () => {
+        const { store } = await createSliceWorkspace("ws-route-timeout-bound");
+        let classified = 0;
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round < 4 ? "tool_calls" : "stop",
+                    toolCalls: round < 4 ? [{ id: `bound-${round}`, name: "noop", argumentsJson: JSON.stringify({ round }) }] : [],
+                };
+            },
+        }, { currentGatewayInstanceId: "test", async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; } },
+        [{ name: "noop", description: "Keep paths unchanged", effectClass: "pure_read" }], {
+            multiTurnWorkspaceContext: true,
+            classifier: async () => { classified += 1; return new Promise(() => {}); },
+        });
+        const config = runtime.getServiceConfig();
+        runtime.setServiceConfig({ ...config, decision: { ...config.decision, timeoutMs: 10 } });
+        await runtime.startRun("route-timeout-bound", "Create an SVG", TEST_CONFIG);
+        assert.equal(classified, 2, "The fallback must not trigger paid classification on every tool round");
+        const routes = (await store.getJournal()).filter((r) => r.payload.harnessRouting).map((r) => r.payload.harnessRouting as Record<string, unknown>);
+        assert.deepEqual(routes.map((route) => route.cacheHit), [false, false, true, true]);
+        assert.deepEqual(routes.map((route) => route.attemptCount), [1, 2, 2, 2]);
+    });
+
+    it("invalidates routing when decision settings change and preserves unrelated setting cache hits", async () => {
+        const changes: readonly Partial<ServiceCapabilitiesConfigSpec["decision"]>[] = [
+            { timeoutMs: 900 },
+            { endpointUrl: "https://other.example.test/decisions" },
+            { model: "other-classifier" },
+            { apiKey: "replacement-test-key" },
+            { threshold: 0.9 },
+            { mode: "openai-decisions" },
+        ];
+        for (const change of changes) {
+            const { store } = await createSliceWorkspace("ws-route-settings");
+            let classified = 0;
+            let round = 0;
+            const runtime = new AgentKernelRuntime(store, {
+                async *streamChat(req) {
+                    round += 1;
+                    const config = runtime.getServiceConfig();
+                    if (round === 1) runtime.setServiceConfig({ ...config, imageMode: "local-deterministic-svg" });
+                    if (round === 2) runtime.setServiceConfig({ ...config, decision: { ...config.decision, ...change } });
+                    yield {
+                        providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                        finishReason: round < 3 ? "tool_calls" : "stop",
+                        toolCalls: round < 3 ? [{ id: `settings-${round}`, name: "noop", argumentsJson: JSON.stringify({ round }) }] : [],
+                    };
+                },
+            }, { currentGatewayInstanceId: "test", async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; } },
+            [{ name: "noop", description: "Keep paths unchanged", effectClass: "pure_read" }], {
+                multiTurnWorkspaceContext: true,
+                classifier: async () => {
+                    classified += 1;
+                    return { status: "matched", specialistIds: [classified === 1 ? "svg-multimodal-designer" : "diagram-design"] };
+                },
+            });
+            await runtime.startRun("route-settings", "Draw a diagram", TEST_CONFIG);
+            assert.equal(classified, 2, `Routing must refresh after changing ${Object.keys(change)[0]}`);
+            const routes = (await store.getJournal()).filter((r) => r.payload.harnessRouting).map((r) => r.payload.harnessRouting as Record<string, unknown>);
+            assert.deepEqual(routes.map((route) => route.cacheHit), [false, true, false]);
+            assert.deepEqual(routes.map((route) => route.attemptCount), [1, 1, 1]);
+            assert.deepEqual(routes[2]!.specialistIds, ["diagram-design"]);
+        }
+    });
+
+    it("does not refill the routing cache with an obsolete in-flight settings result", async () => {
+        const { store } = await createSliceWorkspace("ws-route-settings-race");
+        let enter!: () => void;
+        let release!: () => void;
+        const entered = new Promise<void>((done) => { enter = done; });
+        const held = new Promise<void>((done) => { release = done; });
+        let classified = 0;
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? [{ id: "settings-race", name: "noop", argumentsJson: "{}" }] : [],
+                };
+            },
+        }, { currentGatewayInstanceId: "test", async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; } },
+        [{ name: "noop", description: "Keep paths unchanged", effectClass: "pure_read" }], {
+            multiTurnWorkspaceContext: true,
+            classifier: async () => {
+                classified += 1;
+                if (classified === 1) { enter(); await held; }
+                return { status: "matched", specialistIds: [classified === 1 ? "svg-multimodal-designer" : "diagram-design"] };
+            },
+        });
+        const run = runtime.startRun("route-settings-race", "Draw a diagram", TEST_CONFIG);
+        try {
+            await entered;
+            const config = runtime.getServiceConfig();
+            runtime.setServiceConfig({ ...config, decision: { ...config.decision, threshold: 0.9 } });
+        } finally { release(); }
+        await run;
+        assert.equal(classified, 2, "An old in-flight response must not repopulate the new-settings cache");
+    });
+
     it("routes vector, raster, app, diagram, and article tasks without adding unrelated game guidance", () => {
         const router = new VelesHarnessRouter();
         const cases: readonly [string, readonly string[], readonly string[]][] = [
@@ -362,8 +830,8 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
         const exported = await store.exportWorkspaceBundle();
         const routing = exported.journal.filter((r) => r.payload.harnessRouting).map((r) => r.payload.harnessRouting);
         assert.deepEqual(routing, [
-            { source: "tier1_classifier", specialistIds: ["svg-multimodal-designer"], configuredMode: "typesafe" },
-            { source: "tier0_deterministic", specialistIds: ["svg-multimodal-designer"], configuredMode: "typesafe", fallbackReason: "below_threshold" },
+            { source: "tier1_classifier", specialistIds: ["svg-multimodal-designer"], configuredMode: "typesafe", cacheHit: false, attemptCount: 1 },
+            { source: "tier0_deterministic", specialistIds: ["svg-multimodal-designer"], configuredMode: "typesafe", fallbackReason: "below_threshold", cacheHit: false, attemptCount: 1 },
         ]);
         assert.equal(rounds, 2);
         assert.ok(!JSON.stringify(exported).includes("private-test-credential"));
@@ -618,6 +1086,31 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
                     }),
                 } as Response;
             }
+            if (url.endsWith("/responses") && Array.isArray(body.input)) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        output: [{ type: "image_generation_call", result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }],
+                    }),
+                } as Response;
+            }
+            if (url.endsWith("/images/generations")) {
+                if ("response_format" in body) {
+                    return {
+                        ok: false,
+                        status: 400,
+                        text: async () => JSON.stringify({ error: { code: "unknown_parameter", message: "Unknown parameter: 'response_format'." } }),
+                    } as Response;
+                }
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }],
+                    }),
+                } as Response;
+            }
             return { ok: false, status: 500, json: async () => ({}) } as Response;
         }) as typeof globalThis.fetch;
 
@@ -739,6 +1232,37 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
             });
             assert.ok(searchRes.outputText.includes("[Offline Web Search Fallback]"));
             assert.equal(capturedRequests.length, countBeforeTools);
+
+            // 6. Verify image.transform in openai-dalle3 mode passes sourceDataUrl + clean in-place edit instruction to /responses, and image.generate retries without response_format on HTTP 400
+            activeServiceCfg = { ...activeServiceCfg, imageMode: "openai-dalle3" };
+            await store.writeWorkspaceFile("assets/horse.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+            const txRes = await tools.executeTool({
+                runId: "r-svc-2",
+                operationId: "op-tx-dalle",
+                toolName: "image.transform",
+                effectClass: "idempotent_write",
+                args: {
+                    sourcePath: "assets/horse.png",
+                    outputPath: "assets/horse-rainbow.png",
+                    prompt: "change the color of the subject to rainbow",
+                },
+            });
+            assert.match(txRes.outputText, /openai:responses\.image_generation\(edit\)/);
+            const editReq = capturedRequests.at(-1)!;
+            assert.equal(editReq.url, "https://api.openai.com/v1/responses");
+            const editInputText = JSON.stringify(editReq.body.input);
+            assert.match(editInputText, /Edit the attached source image in-place: change the color of the subject to rainbow/);
+            assert.doesNotMatch(editInputText, /flux-4b-lora/);
+            assert.doesNotMatch(editInputText, /\[source:/);
+
+            const genRetryRes = await tools.executeTool({
+                runId: "r-svc-2",
+                operationId: "op-gen-retry",
+                toolName: "image.generate",
+                effectClass: "idempotent_write",
+                args: { outputPath: "assets/gen.png", prompt: "a brown horse" },
+            });
+            assert.match(genRetryRes.outputText, /openai:dall-e-3/);
         } finally {
             globalThis.fetch = originalFetch;
         }
@@ -1441,7 +1965,37 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
         assert.ok(afterSingle.includes("const bins = Number(window.veles.kv.get('bins', 12)); // $& literal"));
         await store.writeWorkspaceFile("preview/app.js", afterSingle);
 
-        // 2. Indentation-tolerant line match & multi-edit batch
+        // 2. Indentation-tolerant line match, single-line collapsed multi-line match (snake_e.json), & multi-edit batch
+        await store.writeWorkspaceFile(
+            "preview/snake.js",
+            [
+                "if (this.x >= canvas.width) {",
+                "    this.x = 0;",
+                "}",
+                "",
+                "if (this.y >= canvas.height) {",
+                "    this.y = 0;",
+                "}",
+            ].join("\n"),
+        );
+        const collapsedSnakeEdit = await tools.executeTool({
+            runId: "r-edit-snake",
+            operationId: "op-edit-snake",
+            toolName: "workspace.edit_file",
+            effectClass: "idempotent_write",
+            args: {
+                path: "preview/snake.js",
+                target: "if (this.x >= canvas.width) { this.x = 0; } if (this.y >= canvas.height) { this.y = 0; }",
+                replacement: "if (this.x >= canvas.width || this.y >= canvas.height) {\n    this.endGame();\n}",
+            },
+        });
+        assert.ok(
+            String(collapsedSnakeEdit.fileUpdates?.["preview/snake.js"]).includes(
+                "this.endGame();",
+            ),
+            "Single-line whitespace-collapsed target must match multi-line span in workspace.edit_file",
+        );
+
         const batchEdit = await tools.executeTool({
             runId: "r-edit-2",
             operationId: "op-edit-2",
@@ -1851,5 +2405,588 @@ describe("Veles In-Browser Agent Harness (Multi-Tool Batching, sha256 Drift, Spe
                 }),
             /ERR_FETCH_DNS_RESOLUTION_FAILED|ERR_FETCH_PRIVATE_HOST_BLOCKED/,
         );
+    });
+
+    it("bounds structural signature fields and their aggregate system-header contribution", () => {
+        const longField = "x".repeat(100_000);
+        const cases = [
+            ["assets/object.json", JSON.stringify({ [longField + "\nextra"]: 1 })],
+            ["assets/array.json", JSON.stringify([{ [longField]: 1 }])],
+            ["assets/data.csv", `${longField},value\n1,2`],
+            ["assets/data.tsv", `${longField}\tvalue\n1\t2`],
+            ["preview/index.html", `<script src="${longField}\nscript.js"></script>`],
+            ["preview/script.js", `function ${longField}() {}`],
+            ["assets/shape.svg", `<svg viewBox="${longField}\n0 10 10"></svg>`],
+        ];
+        for (const [path, content] of cases) {
+            const signature = summarizeWorkspaceFileSignature(path!, content!);
+            assert.ok(signature && signature.length <= 256, `${path}: signature must be bounded`);
+            assert.doesNotMatch(signature, /[\r\n\t]/, `${path}: signature must stay on one line`);
+        }
+
+        const fileTree = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`assets/data-${i}.json`, "a".repeat(64)]));
+        const signature = summarizeWorkspaceFileSignature("assets/object.json", JSON.stringify({ [longField]: 1 }))!;
+        const fileSignatures = Object.fromEntries(Object.keys(fileTree).map((path) => [path, signature]));
+        const baseMessages = ContextBuilder.buildMessages([], { fileTree });
+        const messages = ContextBuilder.buildMessages([], { fileTree, fileSignatures, maxCharBudget: 48_000 });
+        assert.ok(messages[0]!.content.length - baseMessages[0]!.content.length <= 8_000);
+        assert.ok(messages[0]!.content.length <= 48_000);
+        assert.match(messages[0]!.content, /assets\/data-199\.json/);
+        const injected = ContextBuilder.buildMessages([], {
+            fileTree: { "assets/data.json": "a".repeat(64) },
+            fileSignatures: { "assets/data.json": `${longField}\nignored` },
+            maxCharBudget: 1_000,
+        });
+        assert.ok(injected[0]!.content.length <= 1_000, "Direct signature inputs must obey the header budget too");
+        assert.doesNotMatch(injected[0]!.content, /\nignored/);
+    });
+
+    it("skips unsupported assets and reuses file signatures until their content hash changes", async (t) => {
+        const { store, blobBackend } = await createSliceWorkspace("ws-signature-cache");
+        await store.writeWorkspaceFile("assets/video.mp4", new Uint8Array(1024 * 1024).fill(65));
+        await store.writeWorkspaceFile("assets/data.json", '{"before":1}');
+        const tree = await store.getFileTree();
+        const reads = t.mock.method(blobBackend, "readBytes");
+        const observedPrompts: string[] = [];
+        let round = 0;
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                observedPrompts.push(req.messages[0]!.content);
+                round += 1;
+                yield {
+                    providerId: req.config.providerId, model: req.config.model,
+                    deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? [{ id: "noop-1", name: "noop", argumentsJson: "{}" }] : [],
+                };
+            },
+        }, {
+            currentGatewayInstanceId: "test",
+            async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; },
+        }, [{ name: "noop", description: "No workspace changes", effectClass: "pure_read" }], { multiTurnWorkspaceContext: true });
+        await runtime.startRun("signature-cache-1", "Continue", TEST_CONFIG);
+        const countReads = (hash: string) => reads.mock.calls.filter((call) => call.arguments[0] === hash).length;
+        assert.equal(countReads(tree["assets/video.mp4"]!), 0, "Unsupported assets must never be read for signatures");
+        assert.equal(countReads(tree["assets/data.json"]!), 1, "An unchanged signature should be reused across inference rounds");
+        assert.ok(observedPrompts.every((prompt) => prompt.includes("keys: [before]")));
+
+        await store.writeWorkspaceFile("assets/data.json", '{"after":2}');
+        reads.mock.resetCalls();
+        await runtime.startRun("signature-cache-2", "Continue", TEST_CONFIG);
+        assert.match(observedPrompts.at(-1)!, /keys: \[after\]/);
+        assert.equal(reads.mock.callCount(), 1, "Only the changed supported blob should be read");
+    });
+
+    it("refuses a file signature read when its requested manifest hash is stale", async () => {
+        const { store } = await createSliceWorkspace("ws-signature-version");
+        await store.writeWorkspaceFile("assets/data.json", '{"old":1}');
+        const oldHash = (await store.getFileTree())["assets/data.json"]!;
+        await store.writeWorkspaceFile("assets/data.json", '{"new":2}');
+        await assert.rejects(store.readFileText("assets/data.json", oldHash), /ERR_FILE_CHANGED/);
+    });
+
+    it("caches empty and oversized signature results, separates formats, and retries transient reads", async (t) => {
+        const { store } = await createSliceWorkspace("ws-signature-misses");
+        const source = "function renderPlot() {}";
+        await store.writeWorkspaceFile("preview/shared.js", source);
+        await store.writeWorkspaceFile("preview/shared.json", source);
+        await store.writeWorkspaceFile("preview/empty.js", "const n = 1;");
+        await store.writeWorkspaceFile("assets/large.json", " ".repeat(250_001));
+        await store.writeWorkspaceFile("assets/retry.json", '{"retried":true}');
+        const originalRead = store.readFileText.bind(store);
+        let transientFailure = true;
+        const reads = t.mock.method(store, "readFileText", async (path: string, expectedHash?: string) => {
+            if (path === "assets/retry.json" && transientFailure) {
+                transientFailure = false;
+                throw new Error("temporary read failure");
+            }
+            return originalRead(path, expectedHash);
+        });
+        let round = 0;
+        const prompts: string[] = [];
+        const runtime = new AgentKernelRuntime(store, {
+            async *streamChat(req) {
+                round += 1;
+                prompts.push(req.messages[0]!.content);
+                yield {
+                    providerId: req.config.providerId, model: req.config.model, deltaText: "", usage: null,
+                    finishReason: round === 1 ? "tool_calls" : "stop",
+                    toolCalls: round === 1 ? [{ id: "noop-2", name: "noop", argumentsJson: "{}" }] : [],
+                };
+            },
+        }, {
+            currentGatewayInstanceId: "test",
+            async executeTool() { return { outputText: "ok", gatewayInstanceId: "test" }; },
+        }, [{ name: "noop", description: "No workspace changes", effectClass: "pure_read" }], { multiTurnWorkspaceContext: true });
+        await runtime.startRun("signature-misses", "Continue", TEST_CONFIG);
+        for (const path of ["preview/shared.js", "preview/shared.json", "preview/empty.js", "assets/large.json"]) {
+            assert.equal(reads.mock.calls.filter((call) => call.arguments[0] === path).length, 1, `${path}: read once`);
+        }
+        assert.equal(reads.mock.calls.filter((call) => call.arguments[0] === "assets/retry.json").length, 2);
+        assert.match(prompts[0]!, /shared\.js .*\(js: fns: \[renderPlot\]\)/);
+        assert.match(prompts[0]!, /shared\.json .*\(json: invalid\)/);
+        assert.doesNotMatch(prompts[0]!, /keys: \[retried\]/);
+        assert.match(prompts[1]!, /keys: \[retried\]/);
+    });
+
+    it("measures folding savings from retained serialized tool messages", () => {
+        const record = (seq: number, runId: string, type: RunJournalRecord["type"], payload: Record<string, unknown>): RunJournalRecord => ({
+            eventId: `econ-${seq}`, workspaceId: "ws-economics", runId, seq, type,
+            schemaVersion: 1, timestampMs: seq, relatedOperationId: null, committedState: "inferring", payload,
+        });
+        const content = '\n"\\'.repeat(500);
+        const args = { path: "preview/a.txt", content };
+        const records = [
+            record(1, "old", "RunCreated", { prompt: "Write source" }),
+            record(2, "old", "ToolIntentLogged", { toolCallId: "write-1", toolName: "workspace.write_file", args }),
+            record(3, "old", "ToolResultCommitted", { toolCallId: "write-1", outputText: "ok" }),
+            record(4, "new", "RunCreated", { prompt: "Current turn" }),
+        ];
+        const foldedArgs = { ...args, content: `<folded ${content.length} chars; read from OPFS if needed>` };
+        const economy = ContextBuilder.measureContextEconomics(records, { hotRunWindow: 1 });
+        assert.equal(economy.foldedSavedChars, JSON.stringify(args).length - JSON.stringify(foldedArgs).length);
+        assert.equal(economy.coldFoldedRunCount, 1);
+        const dropped = ContextBuilder.measureContextEconomics(records, { hotRunWindow: 1, maxCharBudget: 20 });
+        assert.equal(dropped.foldedSavedChars, 0, "Budget-discarded records cannot claim folding savings");
+        assert.equal(dropped.coldFoldedRunCount, 0);
+        assert.equal(dropped.hotRunCount, 1);
+        const partialBudget = ContextBuilder.measureContextEconomics(records, { hotRunWindow: 1, maxCharBudget: economy.totalChars - "Write source".length });
+        assert.equal(partialBudget.foldedSavedChars, economy.foldedSavedChars, "Trimming only the old user message must preserve its retained tool savings");
+    });
+
+    it("counts folded image attachments and reports only the signatures fitted beside the active turn", () => {
+        const record = (seq: number, runId: string, type: RunJournalRecord["type"], payload: Record<string, unknown>): RunJournalRecord => ({
+            eventId: `image-econ-${seq}`, workspaceId: "ws-image-economics", runId, seq, type,
+            schemaVersion: 1, timestampMs: seq, relatedOperationId: null, committedState: "inferring", payload,
+        });
+        const records = [
+            record(1, "old", "RunCreated", { prompt: "Inspect image" }),
+            record(2, "old", "ToolIntentLogged", { toolCallId: "image-1", toolName: "workspace.inspect_image", args: {} }),
+            record(3, "old", "ToolResultCommitted", { toolCallId: "image-1", outputText: "image", imageDataUrls: [`data:image/png;base64,${"A".repeat(5000)}`] }),
+            record(4, "new", "RunCreated", { prompt: "Current turn" }),
+        ];
+        const hot = ContextBuilder.measureContextEconomics(records, { hotRunWindow: 2 });
+        const cold = ContextBuilder.measureContextEconomics(records, { hotRunWindow: 1 });
+        assert.equal(cold.foldedSavedChars, hot.totalChars - cold.totalChars);
+        assert.ok(cold.foldedSavedChars > 4_000, "Folding also removes the image attachment's user-message label");
+
+        const fileTree = { "assets/data.json": "a".repeat(64) };
+        const fileSignatures = { "assets/data.json": "json: object, keys: [largeDataset]" };
+        const onlyActive = [record(5, "active", "RunCreated", { prompt: "P".repeat(400) })];
+        const bare = ContextBuilder.buildContext(onlyActive, { fileTree });
+        const fitted = ContextBuilder.buildContext(onlyActive, { fileTree, fileSignatures, maxCharBudget: bare.economics.totalChars });
+        assert.deepEqual(fitted.messages, bare.messages, "Optional signatures must yield to the active turn");
+        assert.equal(fitted.economics.workspaceTreeChars, bare.economics.workspaceTreeChars);
+        assert.equal(fitted.economics.totalChars, bare.economics.totalChars);
+    });
+
+    it("runs mechanical preflight checks on workspace writes and injects structural file signatures into ContextBuilder", async () => {
+        const { store } = await createSliceWorkspace("ws-preflight-sig");
+        const tools = new BrowserToolRegistry(store);
+
+        // 1. Mechanical Preflight ("Bend Law Check"): catches top-level await in classic <script>, unloaded Chart.js, placeholder stubs, and localStorage/kv.then
+        const badHtml = [
+            "<!doctype html><html><body><canvas id='scatterCanvas'></canvas><script>",
+            "const data = await fetch('stats.json').then(r => r.json());",
+            "// Chart rendering logic (e.g., using a basic HTML canvas or a library like Chart.js) goes here.",
+            "new Chart(document.getElementById('scatterCanvas'), {});",
+            "localStorage.setItem('filter', 'all');",
+            "window.veles.kv.get('filter').then(v => console.log(v));",
+            "</script></body></html>",
+        ].join("\n");
+
+        const writeOut = await tools.executeTool({
+            runId: "r-pf-1",
+            operationId: "op-pf-html",
+            toolName: "workspace.write_file",
+            effectClass: "idempotent_write",
+            args: { path: "preview/index.html", content: badHtml },
+        });
+        assert.match(writeOut.outputText, /\[PREFLIGHT WARNING: JS SyntaxError in preview\/index\.html inline <script #1>/);
+        assert.match(writeOut.outputText, /\[PREFLIGHT WARNING: .*placeholder comment/i);
+        assert.match(writeOut.outputText, /\[PREFLIGHT WARNING: .*new Chart\(\.\.\.\) without loading Chart\.js/);
+        assert.match(writeOut.outputText, /\[PREFLIGHT WARNING: Direct localStorage\/sessionStorage access/);
+
+        // Valid <script> with async IIFE and 2D canvas drawing produces zero preflight warnings
+        const cleanHtml = [
+            "<!doctype html><html><head><link rel='stylesheet' href='style.css'></head>",
+            "<body><canvas id='scatterCanvas'></canvas><select id='filterSelect'></select>",
+            "<script src='script.js'></script>",
+            "<script>(async () => { const f = window.veles.kv.get('filter'); })();</script></body></html>",
+        ].join("\n");
+        const cleanOut = await tools.executeTool({
+            runId: "r-pf-1",
+            operationId: "op-pf-clean",
+            toolName: "workspace.write_file",
+            effectClass: "idempotent_write",
+            args: { path: "preview/index.html", content: cleanHtml },
+        });
+        assert.ok(!cleanOut.outputText.includes("[PREFLIGHT WARNING"), "Clean HTML must not emit preflight warnings");
+        assert.equal(verifyWorkspaceFilePreflight("preview/stats.json", "{bad json").length, 1);
+
+        // 2. Structural File Signatures ("Zero-Round Project Intelligence")
+        await store.writeWorkspaceFile(
+            "assets/OldFaithful.csv",
+            "rownames,TimeEruption,TimeWaiting\n1,3.6,79\n2,1.8,54\n",
+        );
+        await store.writeWorkspaceFile(
+            "preview/stats.json",
+            JSON.stringify([{ eruption: 3.6, waiting: 79 }, { eruption: 1.8, waiting: 54 }]),
+        );
+        await store.writeWorkspaceFile("preview/index.html", cleanHtml);
+        await store.writeWorkspaceFile(
+            "preview/script.js",
+            "function renderScatter(pts) {}\nconst applyFilter = (mode) => {};",
+        );
+
+        assert.equal(
+            summarizeWorkspaceFileSignature(
+                "assets/OldFaithful.csv",
+                "rownames,TimeEruption,TimeWaiting\n1,3.6,79\n2,1.8,54\n",
+            ),
+            "csv: 2 rows, cols: [rownames, TimeEruption, TimeWaiting]",
+        );
+        assert.equal(
+            summarizeWorkspaceFileSignature(
+                "preview/stats.json",
+                JSON.stringify([{ eruption: 3.6, waiting: 79 }]),
+            ),
+            "json: array[1], itemKeys: [eruption, waiting]",
+        );
+
+        let capturedSystemPrompt = "";
+        const runtime = new AgentKernelRuntime(
+            store,
+            {
+                async *streamChat(req) {
+                    capturedSystemPrompt = req.messages.find((m) => m.role === "system")?.content ?? "";
+                    yield {
+                        providerId: req.config.providerId,
+                        model: req.config.model,
+                        deltaText: "Done",
+                        toolCalls: [],
+                        usage: null,
+                        finishReason: "stop",
+                    };
+                },
+            },
+            tools,
+            tools.getToolDefinitions(),
+            { multiTurnWorkspaceContext: true },
+        );
+        await runtime.startRun("run-sig-check", "Plot OldFaithful scatter chart", TEST_CONFIG);
+        assert.match(
+            capturedSystemPrompt,
+            /assets\/OldFaithful\.csv \[sha256:[0-9a-f]{8}\] \(csv: 2 rows, cols: \[rownames, TimeEruption, TimeWaiting\]\)/,
+        );
+        assert.match(
+            capturedSystemPrompt,
+            /preview\/stats\.json \[sha256:[0-9a-f]{8}\] \(json: array\[2\], itemKeys: \[eruption, waiting\]\)/,
+        );
+        assert.match(
+            capturedSystemPrompt,
+            /preview\/index\.html \[sha256:[0-9a-f]{8}\] \(html: <canvas>, refs: \[style\.css, script\.js\], ids: \[#scatterCanvas, #filterSelect\]\)/,
+        );
+        assert.match(
+            capturedSystemPrompt,
+            /preview\/script\.js \[sha256:[0-9a-f]{8}\] \(js: fns: \[renderScatter, applyFilter\]\)/,
+        );
+
+        // 3. Verify Prompt-Cache-Friendly ordering (Specialist Guidance precedes volatile OPFS Workspace Tree)
+        const specialistIdx = capturedSystemPrompt.indexOf("--- Active In-Browser Specialist Guidance ---");
+        const treeIdx = capturedSystemPrompt.indexOf("Current Committed OPFS Workspace Tree:");
+        assert.ok(specialistIdx > 0 && specialistIdx < treeIdx, "Specialist capsules must precede volatile OPFS tree for prefix caching");
+
+        // 4. Verify ContextEconomicsSummary checkpointing and cold-run folding savings
+        const journalAfterSig = await store.getJournal();
+        const routingCheckpoint = journalAfterSig.find((r) => r.runId === "run-sig-check" && r.payload.contextEconomics);
+        assert.ok(routingCheckpoint, "Expected contextEconomics on harness-routing CheckpointCommitted record");
+        const econ1 = routingCheckpoint!.payload.contextEconomics as Record<string, number>;
+        assert.ok(econ1.systemContractChars! > 100);
+        assert.ok(econ1.specialistCapsuleChars! > 100);
+        assert.ok(econ1.workspaceTreeChars! > 100);
+        assert.ok(econ1.cacheablePrefixTokens! >= Math.ceil((econ1.systemContractChars! + econ1.specialistCapsuleChars!) / 4));
+
+        // Simulate a cold run with large tool content and measure folded savings
+        const synthJournal = [
+            ...journalAfterSig,
+            {
+                ...journalAfterSig[0]!,
+                seq: 100,
+                runId: "run-cold-big",
+                type: "RunCreated" as const,
+                committedState: "created" as const,
+                payload: { prompt: "Write large file" },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 101,
+                runId: "run-cold-big",
+                type: "ToolIntentLogged" as const,
+                committedState: "awaiting_tool" as const,
+                payload: {
+                    toolCallId: "call_big",
+                    toolName: "workspace.write_file",
+                    args: { path: "preview/big.js", content: "x".repeat(600) },
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 102,
+                runId: "run-cold-big",
+                type: "ToolResultCommitted" as const,
+                committedState: "inferring" as const,
+                payload: {
+                    toolCallId: "call_big",
+                    toolName: "workspace.write_file",
+                    outputText: "y".repeat(500),
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 103,
+                runId: "run-hot-latest",
+                type: "RunCreated" as const,
+                committedState: "created" as const,
+                payload: { prompt: "Latest turn" },
+            },
+        ];
+        const coldEcon = ContextBuilder.measureContextEconomics(synthJournal, {
+            fileTree: await store.getFileTree(),
+            hotRunWindow: 1,
+        });
+        assert.equal(coldEcon.hotRunCount, 1);
+        assert.ok(coldEcon.coldFoldedRunCount >= 1);
+        assert.ok(coldEcon.foldedSavedChars > 800, `Expected >800 folded saved chars, got ${coldEcon.foldedSavedChars}`);
+
+        // 5. Verify Tier-0 Active Context Curation: intra-hot-run superseded file & resolved ToolError folding + outcome-aware hot window
+        const snakeCode = "const snake = 1;\n".repeat(250);
+        const curatedJournal: RunJournalRecord[] = [
+            {
+                ...journalAfterSig[0]!,
+                seq: 201,
+                runId: "run-good-1",
+                type: "RunCreated",
+                committedState: "created",
+                payload: { prompt: "Create snake game" },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 202,
+                runId: "run-good-1",
+                type: "ToolIntentLogged",
+                committedState: "awaiting_tool",
+                payload: {
+                    toolCallId: "c-write-v1",
+                    toolName: "workspace.write_file",
+                    args: { path: "preview/script.js", content: snakeCode },
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 203,
+                runId: "run-good-1",
+                type: "ToolResultCommitted",
+                committedState: "inferring",
+                payload: {
+                    toolCallId: "c-write-v1",
+                    toolName: "workspace.write_file",
+                    outputText: "Updated preview/script.js",
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 204,
+                runId: "run-err-2",
+                type: "RunCreated",
+                committedState: "created",
+                payload: { prompt: "Failed edit attempt" },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 205,
+                runId: "run-err-2",
+                type: "ToolIntentLogged",
+                committedState: "awaiting_tool",
+                payload: {
+                    toolCallId: "c-err-edit",
+                    toolName: "workspace.edit_file",
+                    args: {
+                        path: "preview/script.js",
+                        edits: [{ target: "missing".repeat(30), replacement: "noop" }],
+                    },
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 206,
+                runId: "run-err-2",
+                type: "ToolResultCommitted",
+                committedState: "inferring",
+                payload: {
+                    toolCallId: "c-err-edit",
+                    toolName: "workspace.edit_file",
+                    outputText: "ToolError (workspace.edit_file): ERR_EDIT_TARGET_NOT_FOUND: edit #1 target block not found in 'preview/script.js'",
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 207,
+                runId: "run-active-3",
+                type: "RunCreated",
+                committedState: "created",
+                payload: { prompt: "Read and edit snake" },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 208,
+                runId: "run-active-3",
+                type: "ToolIntentLogged",
+                committedState: "awaiting_tool",
+                payload: {
+                    toolCallId: "c-read-v1",
+                    toolName: "workspace.read_file",
+                    args: { path: "preview/script.js" },
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 209,
+                runId: "run-active-3",
+                type: "ToolResultCommitted",
+                committedState: "inferring",
+                payload: {
+                    toolCallId: "c-read-v1",
+                    toolName: "workspace.read_file",
+                    outputText: snakeCode,
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 210,
+                runId: "run-active-3",
+                type: "ToolIntentLogged",
+                committedState: "awaiting_tool",
+                payload: {
+                    toolCallId: "c-edit-ok",
+                    toolName: "workspace.edit_file",
+                    args: {
+                        path: "preview/script.js",
+                        target: "const snake = 1;",
+                        replacement: "const snake = 2;",
+                    },
+                },
+            },
+            {
+                ...journalAfterSig[0]!,
+                seq: 211,
+                runId: "run-active-3",
+                type: "ToolResultCommitted",
+                committedState: "inferring",
+                payload: {
+                    toolCallId: "c-edit-ok",
+                    toolName: "workspace.edit_file",
+                    outputText: "Edited preview/script.js (1 edit applied)",
+                },
+            },
+        ];
+        const curated = ContextBuilder.buildContext(curatedJournal, {
+            hotRunWindow: 2,
+        });
+        assert.ok(
+            curated.economics.foldedSavedChars > 7_000,
+            `Expected superseded write_file + read_file + resolved ToolError to save >7000 chars, got ${curated.economics.foldedSavedChars}`,
+        );
+        const resolvedErrMsg = curated.messages.find(
+            (m) => m.role === "tool" && m.toolCallId === "c-err-edit",
+        );
+        assert.ok(resolvedErrMsg?.content.includes("[resolved in later step]"));
+    });
+
+    it("supports Code Mode (Programmatic Tool Calling) in workspace.run_script with listFiles, searchFiles, editFile, and SSRF-guarded fetchUrl", async () => {
+        const { store } = await createSliceWorkspace("ws-code-mode-ptc");
+        await store.writeWorkspaceFile(
+            "preview/app.js",
+            "const a = oldApi('one');\nconst b = keepMe();\nconst c = oldApi('two');\n",
+        );
+        await store.writeWorkspaceFile("notes/readme.txt", "unrelated oldApi mention");
+
+        const csvSample = "rownames,TimeEruption,TimeWaiting\n1,3.6,79\n2,1.8,54\n";
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = (async (input: string | URL | Request) => {
+            const url = String(input);
+            if (url === "https://raw.githubusercontent.com/gchoi/Dataset/master/OldFaithful.csv") {
+                return {
+                    ok: true,
+                    status: 200,
+                    headers: new Headers({ "content-type": "text/csv; charset=utf-8" }),
+                    text: async () => csvSample,
+                } as Response;
+            }
+            throw new TypeError(`Unexpected fetch URL: ${url}`);
+        }) as typeof globalThis.fetch;
+
+        try {
+            const tools = new BrowserToolRegistry(store);
+
+            // 1. Single-round Code Mode orchestration: fetch remote CSV -> parse -> compute -> search & edit workspace files -> stage all updates
+            const ptcOut = await tools.executeTool({
+                runId: "r-ptc-1",
+                operationId: "op-ptc-1",
+                toolName: "workspace.run_script",
+                effectClass: "idempotent_write",
+                args: {
+                    code: `
+                        const rawCsv = await tools.web.fetchUrl(
+                            "https://github.com/gchoi/Dataset/blob/master/OldFaithful.csv",
+                            "assets/OldFaithful.csv"
+                        );
+                        const points = rawCsv.trim().split("\\n").slice(1).map((line) => {
+                            const [, e, w] = line.split(",");
+                            return { eruption: Number(e), waiting: Number(w) };
+                        });
+                        writeFile("preview/stats.json", points);
+
+                        const hits = tools.workspace.search("oldApi(", "preview/");
+                        for (const hit of hits) {
+                            tools.workspace.editFile(hit.path, "oldApi(", "newApi(", true);
+                        }
+                        return {
+                            allFiles: listFiles(),
+                            hitCount: hits.length,
+                            pointCount: points.length,
+                            rawFetchGlobal: typeof fetch,
+                        };
+                    `,
+                },
+            });
+
+            assert.ok(ptcOut.outputText.includes('"hitCount": 2'));
+            assert.ok(ptcOut.outputText.includes('"pointCount": 2'));
+            assert.ok(ptcOut.outputText.includes('"rawFetchGlobal": "undefined"'));
+            assert.ok(String(ptcOut.fileUpdates?.["assets/OldFaithful.csv"]).includes("TimeEruption"));
+            assert.ok(String(ptcOut.fileUpdates?.["preview/stats.json"]).includes('"eruption": 3.6'));
+            assert.equal(
+                ptcOut.fileUpdates?.["preview/app.js"],
+                "const a = newApi('one');\nconst b = keepMe();\nconst c = newApi('two');\n",
+            );
+
+            // 2. Verify SSRF private-host guard still blocks private URLs inside Code Mode fetchUrl()
+            await assert.rejects(
+                () =>
+                    tools.executeTool({
+                        runId: "r-ptc-ssrf",
+                        operationId: "op-ptc-ssrf",
+                        toolName: "workspace.run_script",
+                        effectClass: "idempotent_write",
+                        args: {
+                            code: `return await fetchUrl("http://127.0.0.1:11434/api/tags");`,
+                        },
+                    }),
+                /ERR_FETCH_PRIVATE_HOST_BLOCKED/,
+            );
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
     });
 });

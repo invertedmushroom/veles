@@ -24,6 +24,22 @@ import {
   ContextBuilder,
   type WorkerRuntimeEvent,
 } from "./runtime.ts";
+import {
+  type createDefaultWorkspaceTools,
+  createSubagentTools,
+  type RegisteredBrowserTool,
+} from "./tools.ts";
+
+interface WorkspaceRuntimeSlot {
+  readonly workspaceId: string;
+  readonly store: WorkspaceKernelStore;
+  readonly runtime: AgentKernelRuntime;
+  readonly agentManager: AgentManager;
+  activeSessionId: string;
+  readonly activeRequests: Map<string, Promise<unknown>>;
+  activeOperations: number;
+  readonly disposeListeners: () => void;
+}
 
 function attachPortListener(
   port: WorkerPortLike,
@@ -121,40 +137,161 @@ function visibleSessionRun(
 }
 
 export class KernelWorkerHost {
-  private readonly store: WorkspaceKernelStore;
-  private readonly runtime: AgentKernelRuntime;
-  public readonly agentManager: AgentManager;
+  private readonly rootStore: WorkspaceKernelStore;
+  private readonly rootRuntime: AgentKernelRuntime;
+  private readonly slots = new Map<string, WorkspaceRuntimeSlot>();
+  private currentSlot: WorkspaceRuntimeSlot;
   private readonly port: WorkerPortLike;
-  private activeSessionId = "session-main";
-  private readonly activeRequests = new Map<string, Promise<unknown>>();
   private detachPort: (() => void) | null = null;
-  private unsubscribeRuntime: (() => void) | null = null;
-  private unsubscribeJournal: (() => void) | null = null;
   private disposed = false;
+  private readonly workspaceToolsFactory?: typeof createDefaultWorkspaceTools;
 
   constructor(
     store: WorkspaceKernelStore,
     runtime: AgentKernelRuntime,
     port: WorkerPortLike,
     agentManager?: AgentManager,
+    workspaceToolsFactory?: typeof createDefaultWorkspaceTools,
   ) {
-    this.store = store;
-    this.runtime = runtime;
-    this.agentManager = agentManager ?? new AgentManager(store, runtime);
+    this.rootStore = store;
+    this.rootRuntime = runtime;
     this.port = port;
-    this.unsubscribeJournal = this.store.onCommit((record) => {
-      if (!this.disposed) this.port.postMessage({
-        channel: "veles:worker-port", kind: "EVENT", eventType: "JOURNAL_COMMITTED",
-        runId: record.runId, state: record.committedState, record,
-      } satisfies WorkerToUiMessage);
-    });
-
-    this.unsubscribeRuntime = this.runtime.onEvent((ev) => {
-      this.forwardRuntimeEvent(ev);
-    });
+    this.workspaceToolsFactory = workspaceToolsFactory;
+    this.currentSlot = this.bindSlot(
+      store,
+      runtime,
+      agentManager ?? new AgentManager(store, runtime),
+    );
     this.detachPort = attachPortListener(this.port, (ev) => {
       void this.receivePortMessage(ev.data);
     });
+  }
+
+  public get agentManager(): AgentManager {
+    return this.currentSlot.agentManager;
+  }
+
+  public getLatestModelConfig(): ReturnType<AgentKernelRuntime["getLatestModelConfig"]> {
+    const active = this.currentSlot.runtime.getLatestModelConfig();
+    if (active) return active;
+    for (const slot of this.slots.values()) {
+      const cfg = slot.runtime.getLatestModelConfig();
+      if (cfg) return cfg;
+    }
+    return undefined;
+  }
+
+  public getServiceConfig(): ReturnType<AgentKernelRuntime["getServiceConfig"]> {
+    return this.currentSlot.runtime.getServiceConfig();
+  }
+
+  private get runtime(): AgentKernelRuntime {
+    return this.currentSlot.runtime;
+  }
+
+  private bindSlot(
+    store: WorkspaceKernelStore,
+    runtime: AgentKernelRuntime,
+    agentManager: AgentManager,
+  ): WorkspaceRuntimeSlot {
+    const workspaceId = store.getActiveWorkspaceId();
+    const unsubJournal = store.onCommit((record) => {
+      if (!this.disposed) {
+        this.port.postMessage({
+          channel: "veles:worker-port",
+          kind: "EVENT",
+          eventType: "JOURNAL_COMMITTED",
+          runId: record.runId,
+          state: record.committedState,
+          record,
+        } satisfies WorkerToUiMessage);
+      }
+    });
+    const unsubRuntime = runtime.onEvent((ev) => {
+      if (this.currentSlot?.workspaceId === workspaceId) {
+        this.forwardRuntimeEvent(ev);
+      }
+    });
+    const slot: WorkspaceRuntimeSlot = {
+      workspaceId,
+      store,
+      runtime,
+      agentManager,
+      activeSessionId: "session-main",
+      activeRequests: new Map<string, Promise<unknown>>(),
+      activeOperations: 0,
+      disposeListeners: () => {
+        unsubJournal();
+        unsubRuntime();
+      },
+    };
+    this.slots.set(workspaceId, slot);
+    return slot;
+  }
+
+  private createForkedSlot(targetStore: WorkspaceKernelStore): WorkspaceRuntimeSlot {
+    let forkedAdapter: { registerTool?: (t: RegisteredBrowserTool) => void } | null = null;
+    let forkedRuntime: AgentKernelRuntime | undefined;
+    const runtime = this.rootRuntime.forkForStore(targetStore, (adapter, store) => {
+      const workspaceTools = this.workspaceToolsFactory?.(
+        (runId) => forkedRuntime?.getLatestModelConfig(runId),
+        () => forkedRuntime?.getServiceConfig(),
+      );
+      const next =
+        (
+          adapter as {
+            forkForStore?: (s: WorkspaceKernelStore, tools?: readonly RegisteredBrowserTool[]) => typeof adapter;
+          }
+        ).forkForStore?.(store, workspaceTools) ?? adapter;
+      forkedAdapter = next as { registerTool?: (t: RegisteredBrowserTool) => void };
+      return next;
+    });
+    forkedRuntime = runtime;
+    const agentManager = new AgentManager(targetStore, runtime);
+    if (this.rootRuntime.getRegisteredToolNames().includes("agent.delegate")) {
+      for (const subTool of createSubagentTools(agentManager)) {
+        (forkedAdapter as { registerTool?: (t: RegisteredBrowserTool) => void } | null)?.registerTool?.(subTool);
+        runtime.registerToolDefinition(subTool.spec);
+      }
+    }
+    return this.bindSlot(targetStore, runtime, agentManager);
+  }
+
+  private async acquireWorkspaceSlot(
+    workspaceId: string,
+    title?: string,
+  ): Promise<WorkspaceRuntimeSlot> {
+    const cleanId = workspaceId.trim();
+    if (!cleanId) {
+      throw new Error("ERR_INVALID_WORKSPACE_ID: Workspace ID cannot be empty");
+    }
+    const existing = this.slots.get(cleanId);
+    if (existing) {
+      await existing.store.ensureWorkspaceLease(title);
+      if (this.isSlotIdle(existing)) {
+        await existing.agentManager.recoverSessionsFromJournal();
+      }
+      return existing;
+    }
+    const forkedStore = await this.rootStore.forkForWorkspace(cleanId, title);
+    const slot = this.createForkedSlot(forkedStore);
+    await slot.agentManager.recoverSessionsFromJournal();
+    return slot;
+  }
+
+  private async resolveSlotForRun(runId: string): Promise<WorkspaceRuntimeSlot> {
+    for (const slot of this.slots.values()) {
+      if (slot.activeRequests.has(runId)) return slot;
+    }
+    const currentJournal = await this.currentSlot.store.getJournal();
+    if (currentJournal.some((r) => r.runId === runId)) {
+      return this.currentSlot;
+    }
+    for (const slot of this.slots.values()) {
+      const journal = await slot.store.getJournal();
+      if (journal.some((r) => r.runId === runId)) return slot;
+    }
+    return this.currentSlot;
   }
 
   public get isDisposed(): boolean {
@@ -204,46 +341,58 @@ export class KernelWorkerHost {
     requestId: string,
     req: UiToWorkerRequestPayload,
   ): Promise<WorkerToUiMessage> {
+    const slot = this.currentSlot;
     if (req.type === "INIT_WORKSPACE") {
-      if (this.store.getLeaseMode() === "ReadOnly_Observer") {
-        return this.okObserverInitResponse(requestId, req.title);
+      if (slot.store.getLeaseMode() === "ReadOnly_Observer") {
+        return this.okObserverInitResponse(requestId, req.title, slot);
       }
-      await this.store.initWorkspace(req.title);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      await this.withSlotLease(slot, async () => {
+        await slot.store.initWorkspace(req.title);
+        await slot.agentManager.recoverSessionsFromJournal();
+      }, req.title);
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "GET_SNAPSHOT") {
-      return this.okSnapshotResponse(requestId);
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "CREATE_SESSION") {
-      await this.agentManager.createSession({
+      await this.withSlotLease(slot, () => slot.agentManager.createSession({
         id: req.session.id,
         title: req.session.title,
         parentSessionId: req.session.parentSessionId,
-        workspaceId: req.session.workspaceId || this.store.getActiveWorkspaceId(),
+        workspaceId: slot.workspaceId,
         model: req.session.model,
         allowedTools:
-          req.session.allowedTools ?? this.runtime.getRegisteredToolNames(),
+          req.session.allowedTools ?? slot.runtime.getRegisteredToolNames(),
         delegatableTools: req.session.delegatableTools,
         unrestrictedTools: req.session.unrestrictedTools,
         status: "idle",
-      });
-      return this.okSnapshotResponse(requestId);
+      }));
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "START_RUN") {
-      await this.trackRunRequest(req.runId, () => this.handleStartRunRequest(req));
-      return this.okSnapshotResponse(requestId);
+      const slot = this.currentSlot;
+      await this.trackSlotRunRequest(slot, req.runId, () =>
+        this.handleStartRunRequest(slot, req),
+      );
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "CANCEL_RUN") {
-      await this.runtime.cancelActiveRun(req.runId);
-      await this.activeRequests.get(req.runId);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const slot = await this.resolveSlotForRun(req.runId);
+      await this.withSlotLease(slot, async () => {
+        await slot.runtime.cancelActiveRun(req.runId);
+        await slot.activeRequests.get(req.runId);
+        await slot.agentManager.recoverSessionsFromJournal();
+      });
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "RESOLVE_APPROVAL") {
-      await this.trackRunRequest(req.runId, () => this.runtime.resolveApproval(req.runId, req.approved));
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const slot = await this.resolveSlotForRun(req.runId);
+      await this.trackSlotRunRequest(slot, req.runId, () =>
+        slot.runtime.resolveApproval(req.runId, req.approved),
+      );
+      await slot.agentManager.recoverSessionsFromJournal();
+      return this.okSnapshotResponse(requestId, slot);
     }
     return this.dispatchRecoveryOrArchiveRequest(requestId, req);
   }
@@ -252,12 +401,11 @@ export class KernelWorkerHost {
     requestId: string,
     req: UiToWorkerRequestPayload,
   ): Promise<WorkerToUiMessage> {
+    const slot = this.currentSlot;
     if (req.type === "RECOVER_BOOT") {
-      const decision = await this.runtime.recoverUnfinishedRun(
-        req.currentGatewayInstanceId,
-      );
-      await this.agentManager.recoverSessionsFromJournal();
-      const snapshot = await this.buildWorkspaceSnapshot();
+      const decision = await this.withSlotLease(slot, () => slot.runtime.recoverUnfinishedRun(req.currentGatewayInstanceId));
+      await slot.agentManager.recoverSessionsFromJournal();
+      const snapshot = await this.buildWorkspaceSnapshot(slot);
       return {
         channel: "veles:worker-port",
         kind: "RESPONSE",
@@ -268,7 +416,7 @@ export class KernelWorkerHost {
       };
     }
     if (req.type === "EXPORT_BUNDLE") {
-      const bundle = await this.store.exportWorkspaceBundle();
+      const bundle = await slot.store.exportWorkspaceBundle();
       return {
         channel: "veles:worker-port",
         kind: "RESPONSE",
@@ -278,20 +426,26 @@ export class KernelWorkerHost {
       };
     }
     if (req.type === "RESOLVE_UNCERTAIN_TOOL") {
-      await this.trackRunRequest(req.runId, () => this.runtime.resolveUncertainTool(req.runId, req.resolution));
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const slot = await this.resolveSlotForRun(req.runId);
+      await this.trackSlotRunRequest(slot, req.runId, () =>
+        slot.runtime.resolveUncertainTool(req.runId, req.resolution),
+      );
+      await slot.agentManager.recoverSessionsFromJournal();
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "SIMULATE_CHAOS") {
-      await this.executeChaosScenario(req.scenario);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      await this.withSlotLease(slot, () => this.executeChaosScenario(req.scenario, slot));
+      await slot.agentManager.recoverSessionsFromJournal();
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "IMPORT_BUNDLE") {
-      await this.cancelInFlightRunBeforeWorkspaceChange();
-      await this.store.importWorkspaceBundle(req.bundle);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const slot = this.currentSlot;
+      return this.withSlotLease(slot, async () => {
+        await this.cancelInFlightRunsInSlot(slot);
+        await slot.store.importWorkspaceBundle(req.bundle);
+        await slot.agentManager.recoverSessionsFromJournal();
+        return this.okSnapshotResponse(requestId, slot);
+      });
     }
     return this.dispatchWorkspaceRequest(requestId, req);
   }
@@ -300,112 +454,224 @@ export class KernelWorkerHost {
     requestId: string,
     req: UiToWorkerRequestPayload,
   ): Promise<WorkerToUiMessage> {
+    const slot = this.currentSlot;
     if (req.type === "SWITCH_WORKSPACE") {
-      await this.cancelInFlightRunBeforeWorkspaceChange();
-      this.activeSessionId = "session-main";
-      await this.store.switchWorkspace(req.workspaceId, req.title);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const nextSlot = await this.handleSwitchWorkspaceRequest(
+        req.workspaceId,
+        req.title,
+      );
+      return this.okSnapshotResponse(requestId, nextSlot);
     }
     if (req.type === "DELETE_WORKSPACE") {
-      await this.cancelInFlightRunBeforeWorkspaceChange();
-      this.activeSessionId = "session-main";
-      await this.store.deleteWorkspace(req.workspaceId);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      const nextSlot = await this.handleDeleteWorkspaceRequest(req.workspaceId);
+      return this.okSnapshotResponse(requestId, nextSlot);
     }
     if (req.type === "WRITE_WORKSPACE_FILE") {
-      await this.store.writeWorkspaceFile(req.path, req.content);
-      return this.okSnapshotResponse(requestId);
+      await this.withSlotLease(slot, () => slot.store.writeWorkspaceFile(req.path, req.content));
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "SWITCH_SESSION") {
-      await this.handleSwitchSessionRequest(req.sessionId, req.title);
-      return this.okSnapshotResponse(requestId);
+      await this.withSlotLease(slot, () => this.handleSwitchSessionRequest(slot, req.sessionId, req.title));
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "DELETE_RUN") {
-      await this.store.deleteRun(req.runId);
-      await this.agentManager.recoverSessionsFromJournal();
-      return this.okSnapshotResponse(requestId);
+      await this.withSlotLease(slot, async () => {
+        await slot.store.deleteRun(req.runId, { revertFiles: req.revertFiles === true });
+        await slot.agentManager.recoverSessionsFromJournal();
+      });
+      return this.okSnapshotResponse(requestId, slot);
     }
     if (req.type === "UPDATE_SERVICE_CONFIG") {
-      this.runtime.setServiceConfig(req.serviceConfig);
+      for (const slot of this.slots.values()) {
+        slot.runtime.setServiceConfig(req.serviceConfig);
+      }
       return this.okSnapshotResponse(requestId);
     }
     throw new Error("ERR_UNKNOWN_UI_REQUEST");
   }
 
+  private async handleSwitchWorkspaceRequest(
+    workspaceId: string,
+    title?: string,
+  ): Promise<WorkspaceRuntimeSlot> {
+    const prevSlot = this.currentSlot;
+    const cleanId = workspaceId.trim();
+    if (cleanId === prevSlot.workspaceId) {
+      await prevSlot.store.ensureWorkspaceLease(title);
+      return prevSlot;
+    }
+    const nextSlot = await this.acquireWorkspaceSlot(cleanId, title);
+    this.currentSlot = nextSlot;
+    if (this.isSlotIdle(prevSlot)) {
+      await prevSlot.store.releaseWorkspaceLease();
+    }
+    return nextSlot;
+  }
+
+  private async handleDeleteWorkspaceRequest(
+    workspaceId: string,
+  ): Promise<WorkspaceRuntimeSlot> {
+    const cleanId = workspaceId.trim();
+    const foregroundSlot = this.currentSlot;
+    if (!cleanId) throw new Error("ERR_INVALID_WORKSPACE_ID: Workspace ID cannot be empty");
+    const workspaces = await this.rootStore.listWorkspaces();
+    if (!this.slots.has(cleanId) && !workspaces.some((w) => w.workspaceId === cleanId)) {
+      return foregroundSlot;
+    }
+    const targetSlot = await this.acquireWorkspaceSlot(cleanId);
+    if (targetSlot.store.getLeaseMode() !== "ReadWrite_Leader") {
+      await targetSlot.store.releaseWorkspaceLease();
+      throw new Error("ERR_WORKSPACE_LOCKED_BY_OTHER_TAB: Cannot delete a workspace owned by another tab");
+    }
+    await this.withSlotLease(targetSlot, async () => {
+      await this.cancelInFlightRunsInSlot(targetSlot);
+      await targetSlot.store.deleteWorkspaceStorage(cleanId);
+    });
+    await targetSlot.store.releaseWorkspaceLease();
+    targetSlot.disposeListeners();
+    this.slots.delete(cleanId);
+    if (foregroundSlot.workspaceId !== cleanId) return foregroundSlot;
+    const remaining = await this.rootStore.listWorkspaces();
+    const nextWs = remaining.find((w) => w.workspaceId !== cleanId);
+    const nextId = nextWs
+      ? nextWs.workspaceId
+      : cleanId === "ws-alpha"
+        ? "ws-default"
+        : "ws-alpha";
+    const nextTitle = nextWs ? nextWs.title : "Alpha";
+    const nextSlot = await this.acquireWorkspaceSlot(nextId, nextTitle);
+    this.currentSlot = nextSlot;
+    return nextSlot;
+  }
+
   private async handleStartRunRequest(
+    slot: WorkspaceRuntimeSlot,
     req: Extract<UiToWorkerRequestPayload, { readonly type: "START_RUN" }>,
   ): Promise<void> {
     if (req.serviceConfig) {
-      this.runtime.setServiceConfig(req.serviceConfig);
+      for (const s of this.slots.values()) {
+        s.runtime.setServiceConfig(req.serviceConfig);
+      }
     }
     const sessionId = req.sessionId?.trim() || "session-main";
-    this.activeSessionId = sessionId;
-    const existing = this.agentManager.getSession(sessionId);
-    this.agentManager.upsertSessionInMemory({
+    slot.activeSessionId = sessionId;
+    const existing = slot.agentManager.getSession(sessionId);
+    slot.agentManager.upsertSessionInMemory({
       id: sessionId,
       title: existing?.title,
       parentSessionId: existing?.parentSessionId,
-      workspaceId: this.store.getActiveWorkspaceId(),
+      workspaceId: slot.store.getActiveWorkspaceId(),
       model: req.providerConfig,
       allowedTools:
-        existing?.allowedTools ?? this.runtime.getRegisteredToolNames(),
+        existing?.allowedTools ?? slot.runtime.getRegisteredToolNames(),
       delegatableTools: existing?.delegatableTools,
       unrestrictedTools: existing?.unrestrictedTools,
       status: "idle",
     });
-    await this.agentManager.runWithId(sessionId, req.prompt, req.runId);
+    await slot.agentManager.runWithId(sessionId, req.prompt, req.runId);
   }
 
   private async handleSwitchSessionRequest(
+    slot: WorkspaceRuntimeSlot,
     rawSessionId: string,
     title?: string,
   ): Promise<void> {
-    await this.cancelInFlightRunBeforeWorkspaceChange();
+    await this.cancelInFlightRunsInSlot(slot);
     const targetId = rawSessionId.trim() || "session-main";
-    this.activeSessionId = targetId;
-    if (targetId !== "session-main" && !this.agentManager.getSession(targetId)) {
-      await this.agentManager.createSession({
+    slot.activeSessionId = targetId;
+    if (targetId !== "session-main" && !slot.agentManager.getSession(targetId)) {
+      await slot.agentManager.createSession({
         id: targetId,
         title: title ?? targetId,
-        workspaceId: this.store.getActiveWorkspaceId(),
+        workspaceId: slot.store.getActiveWorkspaceId(),
         model: {
           providerId: "openai",
           baseUrl: "https://api.openai.com/v1",
           model: "gpt-4o-mini",
         },
-        allowedTools: this.runtime.getRegisteredToolNames(),
+        allowedTools: slot.runtime.getRegisteredToolNames(),
         status: "idle",
       });
     }
   }
 
-  private async trackRunRequest(runId: string, operation: () => Promise<unknown>): Promise<void> {
-    if (this.activeRequests.has(runId)) throw new Error("ERR_RUN_ALREADY_ACTIVE");
-    const pending = Promise.resolve().then(operation);
-    this.activeRequests.set(runId, pending);
-    try { await pending; }
-    finally { this.activeRequests.delete(runId); }
+  private async trackSlotRunRequest(
+    slot: WorkspaceRuntimeSlot,
+    runId: string,
+    operation: () => Promise<unknown>,
+  ): Promise<void> {
+    if (slot.activeRequests.has(runId)) throw new Error("ERR_RUN_ALREADY_ACTIVE");
+    const pending = Promise.resolve().then(() => this.withSlotLease(slot, operation));
+    slot.activeRequests.set(runId, pending);
+    try {
+      await pending;
+    } finally {
+      slot.activeRequests.delete(runId);
+      await this.releaseIdleBackgroundSlot(slot);
+    }
   }
 
-  private async cancelInFlightRunBeforeWorkspaceChange(): Promise<void> {
+  private isSlotIdle(slot: WorkspaceRuntimeSlot): boolean {
+    return slot.activeRequests.size === 0 && slot.activeOperations === 0;
+  }
+
+  private async releaseIdleBackgroundSlot(slot: WorkspaceRuntimeSlot): Promise<void> {
+    if (this.isSlotIdle(slot) && (this.disposed || this.currentSlot.workspaceId !== slot.workspaceId)) {
+      await slot.store.releaseWorkspaceLease();
+    }
+  }
+
+  private async withSlotLease<T>(
+    slot: WorkspaceRuntimeSlot,
+    operation: () => Promise<T>,
+    title?: string,
+  ): Promise<T> {
+    slot.activeOperations += 1;
+    try {
+      await slot.store.ensureWorkspaceLease(title);
+      if (slot.store.getLeaseMode() !== "ReadWrite_Leader") {
+        throw new Error("ERR_WORKSPACE_LOCKED_BY_OTHER_TAB: This operation requires the workspace lease");
+      }
+      return await operation();
+    } finally {
+      slot.activeOperations -= 1;
+      await this.releaseIdleBackgroundSlot(slot);
+    }
+  }
+
+  private async cancelInFlightRunsInSlot(
+    slot: WorkspaceRuntimeSlot,
+  ): Promise<void> {
     const tails = new Map<string, RunJournalRecord>();
-    for (const record of await this.store.getJournal()) {
+    for (const record of await slot.store.getJournal()) {
       if (isLifecycleJournalRecord(record)) {
         tails.set(record.runId, record);
       }
     }
-    const runIds = new Set(this.activeRequests.keys());
+    const runIds = new Set(slot.activeRequests.keys());
     for (const record of tails.values()) {
-      if (["created", "preparing", "inferring", "awaiting_approval", "awaiting_tool", "executing_tool"].includes(record.committedState)) runIds.add(record.runId);
+      if (
+        [
+          "created",
+          "preparing",
+          "inferring",
+          "awaiting_approval",
+          "awaiting_tool",
+          "executing_tool",
+        ].includes(record.committedState)
+      ) {
+        runIds.add(record.runId);
+      }
     }
-    await Promise.all([...runIds].map((runId) => this.runtime.cancelActiveRun(runId)));
-    await Promise.allSettled([...this.activeRequests.values()]);
+    await Promise.all([...runIds].map((runId) => slot.runtime.cancelActiveRun(runId)));
+    await Promise.allSettled([...slot.activeRequests.values()]);
   }
 
-  private async okSnapshotResponse(requestId: string): Promise<WorkerToUiMessage> {
-    const snapshot = await this.buildWorkspaceSnapshot();
+  private async okSnapshotResponse(
+    requestId: string,
+    slot: WorkspaceRuntimeSlot = this.currentSlot,
+  ): Promise<WorkerToUiMessage> {
+    const snapshot = await this.buildWorkspaceSnapshot(slot);
     return {
       channel: "veles:worker-port",
       kind: "RESPONSE",
@@ -418,13 +684,14 @@ export class KernelWorkerHost {
   private async okObserverInitResponse(
     requestId: string,
     fallbackTitle: string,
+    slot: WorkspaceRuntimeSlot,
   ): Promise<WorkerToUiMessage> {
-    const meta = await this.store.getMetadata();
+    const meta = await slot.store.getMetadata();
     if (meta !== null) {
-      return this.okSnapshotResponse(requestId);
+      return this.okSnapshotResponse(requestId, slot);
     }
     const emptySnapshot: WorkspaceStateSnapshot = {
-      workspaceId: "ws-alpha",
+      workspaceId: slot.workspaceId,
       title: fallbackTitle,
       headSeq: 0,
       activeRunId: null,
@@ -453,6 +720,7 @@ export class KernelWorkerHost {
       | "quota_exceeded"
       | "drop_stream_mid_inference"
       | "uncertain_tool_outcome",
+    slot: WorkspaceRuntimeSlot,
   ): Promise<void> {
     if (scenario === "quota_exceeded") {
       throw new Error(
@@ -460,21 +728,21 @@ export class KernelWorkerHost {
       );
     }
     const runId = `run-chaos-${Date.now()}`;
-    await this.store.appendEvent({
+    await slot.store.appendEvent({
       eventId: `${runId}-1`,
       runId,
       type: "RunCreated",
       nextState: "created",
       payload: { prompt: `[Chaos Fault Injection: ${scenario}]` },
     });
-    await this.store.appendEvent({
+    await slot.store.appendEvent({
       eventId: `${runId}-2`,
       runId,
       type: "RunPreparing",
       nextState: "preparing",
       payload: {},
     });
-    await this.store.appendEvent({
+    await slot.store.appendEvent({
       eventId: `${runId}-3`,
       runId,
       type: "CheckpointCommitted",
@@ -488,7 +756,7 @@ export class KernelWorkerHost {
         state: "inferring",
         detail: { deltaText: "Uncommitted partial stream before network drop..." },
       });
-      await this.store.appendEvent({
+      await slot.store.appendEvent({
         eventId: `${runId}-4`,
         runId,
         type: "RunInterrupted",
@@ -500,11 +768,11 @@ export class KernelWorkerHost {
       });
       return;
     }
-    await this.seedUncertainToolChaos(runId);
+    await this.seedUncertainToolChaos(runId, slot);
   }
 
-  private async seedUncertainToolChaos(runId: string): Promise<void> {
-    await this.store.appendEvent({
+  private async seedUncertainToolChaos(runId: string, slot: WorkspaceRuntimeSlot): Promise<void> {
+    await slot.store.appendEvent({
       eventId: `${runId}-4`,
       runId,
       type: "ToolIntentLogged",
@@ -518,7 +786,7 @@ export class KernelWorkerHost {
         assistantText: "Dispatching production webhook...",
       },
     });
-    await this.store.appendEvent({
+    await slot.store.appendEvent({
       eventId: `${runId}-5`,
       runId,
       type: "ToolDispatched",
@@ -531,24 +799,26 @@ export class KernelWorkerHost {
         gatewayInstanceId: "gw-crashed-old-instance",
       },
     });
-    await this.runtime.recoverUnfinishedRun("gw-restarted-new-instance");
+    await slot.runtime.recoverUnfinishedRun("gw-restarted-new-instance");
   }
 
-  public async buildWorkspaceSnapshot(): Promise<WorkspaceStateSnapshot> {
-    const meta = await this.store.getMetadata();
+  public async buildWorkspaceSnapshot(
+    slot: WorkspaceRuntimeSlot = this.currentSlot,
+  ): Promise<WorkspaceStateSnapshot> {
+    const meta = await slot.store.getMetadata();
     if (!meta) {
       throw new Error("ERR_WORKSPACE_NOT_INITIALIZED");
     }
-    const journal = await this.store.getJournal();
-    const visible = visibleSessionRun(journal, this.activeSessionId);
-    const fileHashes = await this.store.getFileTree();
+    const journal = await slot.store.getJournal();
+    const visible = visibleSessionRun(journal, slot.activeSessionId);
+    const fileHashes = await slot.store.getFileTree();
     const filePaths = Object.keys(fileHashes).sort();
     const files: Record<string, string> = {};
     for (const relPath of filePaths) {
-      files[relPath] = await this.store.readFileTextOrDataUrl(relPath);
+      files[relPath] = await slot.store.readFileTextOrDataUrl(relPath);
     }
     const messages = ContextBuilder.buildMessages(journal, {
-      sessionId: this.activeSessionId,
+      sessionId: slot.activeSessionId,
       hotRunWindow: 2,
     });
     const pendingApproval = extractPendingApproval(
@@ -561,12 +831,13 @@ export class KernelWorkerHost {
       visible?.runId ?? null,
       visible?.committedState ?? null,
     );
-    const allWorkspaces = await this.store.listWorkspaces();
+    const allWorkspaces = await slot.store.listWorkspaces();
     const workspaces = allWorkspaces.map((w) => ({
       workspaceId: w.workspaceId,
       title: w.title,
       headSeq: w.headSeq,
       updatedAtMs: w.updatedAtMs,
+      runState: w.runState,
     }));
     return {
       workspaceId: meta.workspaceId,
@@ -575,8 +846,8 @@ export class KernelWorkerHost {
       activeRunId: visible?.runId ?? null,
       runState: visible?.committedState ?? null,
       updatedAtMs: meta.updatedAtMs,
-      leaseMode: this.store.getLeaseMode(),
-      gatewayInstanceId: this.runtime.currentGatewayInstanceId,
+      leaseMode: slot.store.getLeaseMode(),
+      gatewayInstanceId: slot.runtime.currentGatewayInstanceId,
       interruptReason,
       files,
       fileHashes,
@@ -584,20 +855,26 @@ export class KernelWorkerHost {
       pendingApproval,
       journal,
       workspaces,
-      sessions: this.agentManager.listSessions(),
-      activeSessionId: this.activeSessionId,
-      serviceConfig: this.runtime.getServiceConfig(),
+      sessions: slot.agentManager.listSessions(),
+      activeSessionId: slot.activeSessionId,
+      serviceConfig: slot.runtime.getServiceConfig(),
     };
   }
 
   public dispose(): void {
-    this.unsubscribeJournal?.();
-    this.unsubscribeJournal = null;
     if (this.disposed) return;
     this.disposed = true;
+    for (const slot of this.slots.values()) {
+      slot.disposeListeners();
+      if (this.isSlotIdle(slot)) {
+        void slot.store.releaseWorkspaceLease();
+      } else {
+        void this.cancelInFlightRunsInSlot(slot)
+          .catch(() => {});
+      }
+    }
+    this.slots.clear();
     this.detachPort?.();
     this.detachPort = null;
-    this.unsubscribeRuntime?.();
-    this.unsubscribeRuntime = null;
   }
 }

@@ -1,4 +1,32 @@
 import { expect, test } from "@playwright/test";
+
+test("remembers service settings and selected models across refresh with optional API keys", async ({ page }) => {
+  await page.route("https://catalog.example.test/v1/models", (route) => route.fulfill({
+    json: { data: Array.from({ length: 250 }, (_, i) => ({ id: `model-${i}` })) },
+  }));
+  await page.goto("/");
+  await page.getByRole("button", { name: "Services", exact: true }).click();
+  await page.locator("#svc-chat-provider").selectOption("lm-studio");
+  await page.locator("#svc-chat-base-url").fill("https://catalog.example.test/v1");
+  await page.locator("#svc-chat-key").fill("test-secret");
+  await page.getByText("Browse provider models", { exact: true }).click();
+  await page.getByRole("button", { name: "Fetch models", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "250 models available" })).toBeVisible();
+  await expect(page.getByLabel("Available models").locator("option")).toHaveCount(100);
+  await page.getByLabel("Filter models").fill("model-249");
+  await page.getByLabel("Available models").selectOption("model-249");
+  await page.reload();
+  await page.getByRole("button", { name: "Services", exact: true }).click();
+  await expect(page.locator("#svc-chat-provider")).toHaveValue("lm-studio");
+  await expect(page.locator("#svc-chat-base-url")).toHaveValue("https://catalog.example.test/v1");
+  await expect(page.locator("#svc-chat-model")).toHaveValue("model-249");
+  await expect(page.locator("#svc-chat-key")).toHaveValue("");
+  await page.getByLabel("Remember API keys in this browser").check();
+  await page.locator("#svc-chat-key").fill("remembered-test-key");
+  await page.reload();
+  await page.getByRole("button", { name: "Services", exact: true }).click();
+  await expect(page.locator("#svc-chat-key")).toHaveValue("remembered-test-key");
+});
 import { configureOfflineRun, openWorkspacePanel } from "./workbench-helpers.ts";
 
 test("shows submitted text immediately, stops a waiting provider, and permits the next run", async ({ page, context }) => {

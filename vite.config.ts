@@ -1,14 +1,39 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { lookup } from "node:dns/promises";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
-import {
-  buildIsolatedWorkerBootstrapSource,
-  isBlockedPrivateHost,
-  PUBLIC_FETCH_PROXY_HEADER,
-  PUBLIC_FETCH_PROXY_VERSION,
-} from "./src/kernel/tools.ts";
+
+interface KernelToolsExports {
+  readonly buildIsolatedWorkerBootstrapSource: () => string;
+  readonly isBlockedPrivateHost: (rawHost: string) => boolean;
+  readonly PUBLIC_FETCH_PROXY_HEADER: string;
+  readonly PUBLIC_FETCH_PROXY_VERSION: string;
+}
+
+let cachedKernelTools: KernelToolsExports | null = null;
+let cachedKernelToolsMtime = -1;
+
+async function getKernelToolsModule(): Promise<KernelToolsExports> {
+  const toolsPath = resolve("src/kernel/tools.ts");
+  const mtime = existsSync(toolsPath) ? statSync(toolsPath).mtimeMs : 0;
+  if (cachedKernelTools && mtime === cachedKernelToolsMtime) {
+    return cachedKernelTools;
+  }
+  try {
+    const mod = (await import(
+      `${pathToFileURL(toolsPath).href}?t=${mtime}`
+    )) as KernelToolsExports;
+    cachedKernelTools = mod;
+    cachedKernelToolsMtime = mtime;
+    return mod;
+  } catch (err) {
+    if (cachedKernelTools) return cachedKernelTools;
+    throw err;
+  }
+}
 
 const VELES_PWA_MANIFEST = {
   id: ".",
@@ -72,6 +97,7 @@ async function assertPublicProxyDestination(parsed: URL): Promise<void> {
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new Error("ERR_FETCH_PRIVATE_HOST_BLOCKED");
   }
+  const { isBlockedPrivateHost } = await getKernelToolsModule();
   const rawHost = parsed.hostname;
   if (isBlockedPrivateHost(rawHost)) {
     throw new Error("ERR_FETCH_PRIVATE_HOST_BLOCKED");
@@ -125,14 +151,17 @@ function registerVelesMiddlewares(middlewares: {
     ) => void | Promise<void>,
   ) => void;
 }): void {
+  void getKernelToolsModule().catch(() => {});
   middlewares.use("/manifest.webmanifest", (_req, res) => {
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/manifest+json; charset=utf-8");
     res.end(JSON.stringify(VELES_PWA_MANIFEST, null, 2));
   });
-  middlewares.use("/api/sandbox/worker.js", (_req, res) => {
+  middlewares.use("/api/sandbox/worker.js", async (_req, res) => {
+    const { buildIsolatedWorkerBootstrapSource } = await getKernelToolsModule();
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
     res.setHeader(
       "Content-Security-Policy",
       "default-src 'none'; script-src 'unsafe-eval'; connect-src 'none'",
@@ -140,6 +169,8 @@ function registerVelesMiddlewares(middlewares: {
     res.end(buildIsolatedWorkerBootstrapSource());
   });
   middlewares.use("/api/proxy/fetch", async (req, res) => {
+    const { PUBLIC_FETCH_PROXY_HEADER, PUBLIC_FETCH_PROXY_VERSION } =
+      await getKernelToolsModule();
     res.setHeader(PUBLIC_FETCH_PROXY_HEADER, PUBLIC_FETCH_PROXY_VERSION);
     try {
       const reqUrl = new URL(req.url ?? "", "http://127.0.0.1");
@@ -224,12 +255,6 @@ export default defineConfig(({ command, mode }) => {
           allEnv.LAYA_API_URL ||
           "http://127.0.0.1:11434/v1/decisions"
         ).trim(),
-      ),
-      __VELES_DEFAULT_PROVIDER__: JSON.stringify(
-        (allEnv.VITE_DEFAULT_PROVIDER || "").trim(),
-      ),
-      __VELES_DEFAULT_DECISION_MODE__: JSON.stringify(
-        (allEnv.VITE_DEFAULT_DECISION_MODE || "").trim(),
       ),
     },
     plugins: [

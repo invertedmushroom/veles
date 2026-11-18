@@ -21,13 +21,17 @@ import type {
   WebSearchServiceMode,
 } from "../protocol/types.ts";
 import type { AgentManager, AgentSession } from "./agent-session.ts";
-import { base64ToBytes } from "./blobs.ts";
+import { base64ToBytes, bytesToBase64 } from "./blobs.ts";
 import type { WorkspaceKernelStore } from "./journal.ts";
 import type {
   ToolExecutionAdapter,
   ToolExecutionOutcome,
   ToolExecutionRequest,
 } from "./runtime.ts";
+import {
+  formatPreflightDiagnosticSuffix,
+  verifyWorkspaceFilePreflight,
+} from "./workspace-intelligence.ts";
 
 export const LOCAL_BROWSER_INSTANCE_ID: GatewayInstanceId = "browser-local-v1";
 
@@ -158,8 +162,11 @@ const writeWorkspaceFileTool: RegisteredBrowserTool = {
     if (typeof args.content !== "string") {
       throw new Error("ERR_TOOL_INVALID_ARGS: 'content' must be a string");
     }
+    const preflightSuffix = formatPreflightDiagnosticSuffix(
+      verifyWorkspaceFilePreflight(safePath, args.content),
+    );
     return {
-      outputText: `Updated ${safePath} (${args.content.length} chars)`,
+      outputText: `Updated ${safePath} (${args.content.length} chars)${preflightSuffix}`,
       fileUpdates: { [safePath]: args.content },
     };
   },
@@ -284,6 +291,56 @@ function findLineTrimmedMatchRange(
     : null;
 }
 
+function scanCollapsedLineSpan(
+  contentLines: readonly string[],
+  startLine: number,
+  collapsedTarget: string,
+): number {
+  const firstNorm = contentLines[startLine]!.replace(/\s+/g, " ").trim();
+  if (!firstNorm || !collapsedTarget.startsWith(firstNorm)) return -1;
+  let acc = "";
+  const maxEnd = Math.min(contentLines.length - 1, startLine + 40);
+  for (let endLine = startLine; endLine <= maxEnd; endLine++) {
+    const seg = contentLines[endLine]!.replace(/\s+/g, " ").trim();
+    if (seg) acc = acc ? `${acc} ${seg}` : seg;
+    if (acc === collapsedTarget) return endLine;
+    if (acc.length >= collapsedTarget.length || !collapsedTarget.startsWith(acc)) {
+      break;
+    }
+  }
+  return -1;
+}
+
+function findCollapsedWhitespaceMatchRange(
+  content: string,
+  target: string,
+): { readonly start: number; readonly end: number; readonly matchCount: number } | null {
+  // Collapsing opaque literals can alter their meaning; require exact or line-trimmed matches.
+  if (/['"`\/]/.test(target)) return null;
+  const collapsedTarget = target.replace(/\s+/g, " ").trim();
+  if (!collapsedTarget) return null;
+  const contentLines = content.split("\n");
+  const lineOffsets: number[] = [];
+  let offset = 0;
+  for (const line of contentLines) {
+    lineOffsets.push(offset);
+    offset += line.length + 1;
+  }
+  let firstStart = -1;
+  let firstEnd = -1;
+  let matchCount = 0;
+  for (let startLine = 0; startLine < contentLines.length; startLine++) {
+    const endLine = scanCollapsedLineSpan(contentLines, startLine, collapsedTarget);
+    if (endLine === -1) continue;
+    matchCount += 1;
+    if (firstStart === -1) {
+      firstStart = lineOffsets[startLine]!;
+      firstEnd = lineOffsets[endLine]! + contentLines[endLine]!.length;
+    }
+  }
+  return matchCount > 0 ? { start: firstStart, end: firstEnd, matchCount } : null;
+}
+
 function applySingleFileEdit(
   content: string,
   edit: WorkspaceFileEditOperation,
@@ -309,21 +366,23 @@ function applySingleFileEdit(
     }
     return content.split(normTarget).join(normReplacement);
   }
-  const trimmedMatch = findLineTrimmedMatchRange(content, normTarget);
-  if (!trimmedMatch) {
+  const fuzzyMatch =
+    findLineTrimmedMatchRange(content, normTarget) ??
+    findCollapsedWhitespaceMatchRange(content, normTarget);
+  if (!fuzzyMatch) {
     throw new Error(
       `ERR_EDIT_TARGET_NOT_FOUND: edit #${index + 1} target block not found in '${safePath}'; call workspace.read_file to verify exact contents`,
     );
   }
-  if (trimmedMatch.matchCount > 1) {
+  if (fuzzyMatch.matchCount > 1) {
     throw new Error(
-      `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${trimmedMatch.matchCount} line-trimmed locations in '${safePath}'; include more surrounding context lines`,
+      `ERR_EDIT_AMBIGUOUS_TARGET: edit #${index + 1} target matched ${fuzzyMatch.matchCount} line-trimmed locations in '${safePath}'; include more surrounding context lines`,
     );
   }
   return (
-    content.slice(0, trimmedMatch.start) +
+    content.slice(0, fuzzyMatch.start) +
     normReplacement +
-    content.slice(trimmedMatch.end)
+    content.slice(fuzzyMatch.end)
   );
 }
 
@@ -370,8 +429,11 @@ const editWorkspaceFileTool: RegisteredBrowserTool = {
         i,
       );
     }
+    const preflightSuffix = formatPreflightDiagnosticSuffix(
+      verifyWorkspaceFilePreflight(safePath, updatedContent),
+    );
     return {
-      outputText: `Edited ${safePath} (${edits.length} edit${edits.length === 1 ? "" : "s"} applied, ${updatedContent.length} chars)`,
+      outputText: `Edited ${safePath} (${edits.length} edit${edits.length === 1 ? "" : "s"} applied, ${updatedContent.length} chars)${preflightSuffix}`,
       fileUpdates: { [safePath]: updatedContent },
     };
   },
@@ -488,6 +550,7 @@ function resolveSafeChildTools(
 
 export interface ImageGenerationProvider {
   generateOrTransform(params: {
+    readonly runId?: string;
     readonly prompt: string;
     readonly sourceDataUrl?: string;
     readonly style?: string;
@@ -547,6 +610,26 @@ async function extractOpenAIErrorDetail(
   }
 }
 
+async function extractImageB64FromGenerationResponse(
+  resp: Response,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const data = (await resp.json()) as {
+    data?: Array<{ b64_json?: string; url?: string }>;
+  };
+  const first = data.data?.[0];
+  if (typeof first?.b64_json === "string" && first.b64_json.length > 0) {
+    return first.b64_json;
+  }
+  if (typeof first?.url === "string" && first.url.startsWith("http")) {
+    const imgResp = await globalThis.fetch(first.url, { signal });
+    if (imgResp.ok && typeof imgResp.arrayBuffer === "function") {
+      return bytesToBase64(new Uint8Array(await imgResp.arrayBuffer()));
+    }
+  }
+  return null;
+}
+
 async function requestOpenAIImageB64(
   endpoint: string,
   apiKey: string,
@@ -555,7 +638,7 @@ async function requestOpenAIImageB64(
   label: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const resp = await globalThis.fetch(endpoint, {
+  let resp = await globalThis.fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -564,15 +647,23 @@ async function requestOpenAIImageB64(
     body: JSON.stringify(body),
     signal,
   });
+  if (!resp.ok && resp.status === 400 && "response_format" in body) {
+    const { response_format: _omitted, ...bodyWithoutFormat } = body;
+    resp = await globalThis.fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(bodyWithoutFormat),
+      signal,
+    });
+  }
   if (!resp.ok) {
     diagnostics.push(`${label}=${await extractOpenAIErrorDetail(resp)}`);
     return null;
   }
-  const data = (await resp.json()) as {
-    data?: Array<{ b64_json?: string }>;
-  };
-  const b64 = data.data?.[0]?.b64_json;
-  return typeof b64 === "string" && b64.length > 0 ? b64 : null;
+  return extractImageB64FromGenerationResponse(resp, signal);
 }
 
 async function requestResponsesImageGenerationB64(
@@ -586,19 +677,24 @@ async function requestResponsesImageGenerationB64(
 ): Promise<string | null> {
   const isRasterSource =
     typeof sourceDataUrl === "string" &&
-    /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(sourceDataUrl);
+    /^data:image\/(png|jpeg|jpg|webp|gif);base64,/i.test(sourceDataUrl);
+  if (sourceDataUrl && !isRasterSource) return null;
+  const editInstruction =
+    `Edit the attached source image in-place: ${prompt}. ` +
+    `Preserve the exact original background, composition, lighting, camera angle, and color/monochrome palette of everything outside the requested change.`;
   const input = isRasterSource
     ? [
         {
           role: "user",
           content: [
-            { type: "input_text", text: prompt },
+            { type: "input_text", text: editInstruction },
             { type: "input_image", image_url: sourceDataUrl },
           ],
         },
       ]
     : prompt;
-  const resp = await globalThis.fetch(`${baseUrl}/responses`, {
+  try {
+    const resp = await globalThis.fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -621,7 +717,12 @@ async function requestResponsesImageGenerationB64(
   const call = (data.output ?? []).find(
     (item) => item.type === "image_generation_call" && typeof item.result === "string",
   );
-  return call?.result ?? null;
+    return call?.result ?? null;
+  } catch (err) {
+    signal?.throwIfAborted();
+    diagnostics.push(`responses.image_generation=${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 function buildSourceVisionContent(
@@ -727,11 +828,20 @@ async function requestChatSvgIllustration(
   }
 }
 
+function formatCleanOpenAIImagePrompt(rawPrompt: string, style?: string): string {
+  const stripped = rawPrompt.replace(/\s*\[source:[^\]]+\]\s*$/i, "").trim();
+  const customStyle =
+    style && style !== "game-asset" && style !== "flux-4b-lora"
+      ? style.trim()
+      : "";
+  return customStyle ? `${stripped} (${customStyle})` : stripped;
+}
+
 async function tryOpenAIRasterEndpoints(
   baseUrl: string,
   apiKey: string,
   model: string,
-  effectivePrompt: string,
+  cleanPrompt: string,
   sourceDataUrl: string | undefined,
   diagnostics: string[],
   imageMode: ImageServiceMode,
@@ -741,18 +851,28 @@ async function tryOpenAIRasterEndpoints(
     return null;
   }
   const genUrl = `${baseUrl}/images/generations`;
-  if (imageMode === "openai-auto" && sourceDataUrl) {
+  if (sourceDataUrl) {
     const edited = await requestResponsesImageGenerationB64(
       baseUrl,
       apiKey,
       model,
-      effectivePrompt,
+      cleanPrompt,
       sourceDataUrl,
       diagnostics,
       signal,
     );
     if (edited) return { b64: edited, via: "openai:responses.image_generation(edit)" };
   }
+  const effectivePrompt = sourceDataUrl
+    ? await synthesizeTransformPromptViaVision(
+        baseUrl,
+        apiKey,
+        model,
+        cleanPrompt,
+        sourceDataUrl,
+        signal,
+      )
+    : cleanPrompt;
   const dalle3 = await requestOpenAIImageB64(
     genUrl,
     apiKey,
@@ -767,8 +887,8 @@ async function tryOpenAIRasterEndpoints(
     "dall-e-3",
     signal,
   );
-  if (dalle3 || imageMode === "openai-dalle3") {
-    return dalle3 ? { b64: dalle3, via: "openai:dall-e-3" } : null;
+  if (dalle3) {
+    return { b64: dalle3, via: "openai:dall-e-3" };
   }
 
   return tryOpenAIGptAndResponsesImage(
@@ -831,13 +951,14 @@ function canUseRemoteImageProvider(
 }
 
 export function createOpenAIImageProvider(
-  modelConfigProvider?: () => ProviderModelConfig | undefined,
+  modelConfigProvider?: (runId?: string) => ProviderModelConfig | undefined,
   fallback: ImageGenerationProvider = defaultLocalImageProvider,
   imageModeProvider?: () => ImageServiceMode,
 ): ImageGenerationProvider {
   return {
     async generateOrTransform(params) {
-      const cfg = modelConfigProvider?.();
+      params.signal?.throwIfAborted();
+      const cfg = modelConfigProvider?.(params.runId);
       const imageMode = imageModeProvider?.() ?? "openai-auto";
       if (!canUseRemoteImageProvider(cfg, imageMode)) {
         return fallback.generateOrTransform(params);
@@ -845,23 +966,16 @@ export function createOpenAIImageProvider(
       const baseUrl = cfg.baseUrl.replace(/\/+$/, "");
       const diagnostics: string[] = [];
       try {
-        const basePrompt = `${params.prompt} (${params.style ?? "game-asset"})`;
-        const effectivePrompt = params.sourceDataUrl
-          ? await synthesizeTransformPromptViaVision(
-              baseUrl,
-              cfg.apiKey,
-              cfg.model,
-              basePrompt,
-              params.sourceDataUrl,
-              params.signal,
-            )
-          : basePrompt;
+        const cleanPrompt = formatCleanOpenAIImagePrompt(
+          params.prompt,
+          params.style,
+        );
 
         const raster = await tryOpenAIRasterEndpoints(
           baseUrl,
           cfg.apiKey,
           cfg.model,
-          effectivePrompt,
+          cleanPrompt,
           params.sourceDataUrl,
           diagnostics,
           imageMode,
@@ -879,7 +993,7 @@ export function createOpenAIImageProvider(
           baseUrl,
           cfg.apiKey,
           cfg.model,
-          effectivePrompt,
+          cleanPrompt,
           params.sourceDataUrl,
           params.signal,
         );
@@ -893,6 +1007,7 @@ export function createOpenAIImageProvider(
       } catch (err) {
         diagnostics.push(err instanceof Error ? err.message : String(err));
       }
+      params.signal?.throwIfAborted();
       const local = await fallback.generateOrTransform(params);
       return {
         ...local,
@@ -965,7 +1080,7 @@ async function querySearxngSearch(
 }
 
 export function createWebSearchTool(
-  modelConfigProvider?: () => ProviderModelConfig | undefined,
+  modelConfigProvider?: (runId?: string) => ProviderModelConfig | undefined,
   webSearchModeProvider?: () => WebSearchServiceMode,
   searxngUrlProvider?: () => string | undefined,
 ): RegisteredBrowserTool {
@@ -984,12 +1099,12 @@ export function createWebSearchTool(
         required: ["query"],
       },
     },
-    async handler(args, _store, signal) {
+    async handler(args, _store, signal, context) {
       const query = nonEmptyString(args.query);
       if (!query) {
         throw new Error("ERR_WEB_SEARCH_EMPTY_QUERY: 'query' must be non-empty");
       }
-      const cfg = modelConfigProvider?.();
+      const cfg = modelConfigProvider?.(context?.runId);
       const mode = webSearchModeProvider?.() ?? "openai-responses";
       if (mode === "searxng") {
         const searxText = await querySearxngSearch(
@@ -1231,11 +1346,19 @@ async function fetchFromPublicProxy(
   signal?: AbortSignal,
 ): Promise<Response> {
   const proxyUrl = `${browserOrigin}/api/proxy/fetch?url=${encodeURIComponent(safeUrl)}`;
-  const response = await globalThis.fetch(proxyUrl, {
-    method: "GET",
-    redirect: "error",
-    signal,
-  });
+  let response: Response;
+  try {
+    response = await globalThis.fetch(proxyUrl, {
+      method: "GET",
+      redirect: "error",
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    throw new Error(
+      "ERR_FETCH_PROXY_UNAVAILABLE: Public fetching requires the Veles /api/proxy/fetch service (Vite dev or preview).",
+    );
+  }
   if (response.headers.get(PUBLIC_FETCH_PROXY_HEADER) !== PUBLIC_FETCH_PROXY_VERSION) {
     throw new Error(
       "ERR_FETCH_PROXY_UNAVAILABLE: Public fetching requires the Veles /api/proxy/fetch service (Vite dev or preview).",
@@ -1413,13 +1536,36 @@ interface IsolatedScriptExecutionResult {
   readonly stagedUpdates: Record<string, string>;
 }
 
+async function executeHostValidatedTextFetch(
+  rawUrl: unknown,
+  signal?: AbortSignal,
+): Promise<string> {
+  const safeUrl = normalizePublicFetchUrl(rawUrl);
+  const resp = await fetchPublicResource(safeUrl, signal);
+  if (!resp.ok) {
+    throw new Error(`ERR_FETCH_HTTP_${resp.status}: Failed to fetch ${safeUrl}`);
+  }
+  const rawText = await resp.text();
+  return rawText
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .slice(0, 500_000);
+}
+
 const SANDBOX_SCRIPT_RUNNER_BODY = `
 const files = JSON.parse(__initialFilesJson);
 const initialSnapshot = Object.assign(Object.create(null), files);
 const stagedUpdates = Object.create(null);
 const logs = [];
+function formatConsoleValue(value) {
+  const tag = Object.prototype.toString.call(value);
+  if (value instanceof Error || tag === "[object Error]" || tag === "[object DOMException]") {
+    return String(value.name || "Error") + ": " + String(value.message || "");
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
 function fmt(args) {
-  return args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+  return args.map(formatConsoleValue).join(" ");
 }
 function normPath(raw) {
   if (typeof raw !== "string" || !raw.trim()) {
@@ -1444,16 +1590,72 @@ const writeFile = (p, content) => {
   files[safe] = text;
   stagedUpdates[safe] = text;
 };
+const listFiles = (prefix) => {
+  const all = Object.keys(files).filter((k) => typeof files[k] === "string").sort();
+  if (typeof prefix !== "string" || !prefix.trim()) return all;
+  const clean = prefix.trim();
+  return all.filter((k) => k.startsWith(clean) || k.includes(clean));
+};
+const searchFiles = (query, pathFilter) => {
+  const matches = [];
+  const isRe = query instanceof RegExp;
+  const needle = isRe ? null : String(query ?? "");
+  if (!isRe && !needle) return matches;
+  for (const p of listFiles(pathFilter)) {
+    const lines = String(files[p] ?? "").replace(/\\r\\n/g, "\\n").split("\\n");
+    for (let i = 0; i < lines.length; i++) {
+      const lineText = lines[i];
+      if (isRe ? query.test(lineText) : lineText.includes(needle)) {
+        matches.push({ path: p, line: i + 1, text: lineText.slice(0, 240) });
+        if (matches.length >= 100) return matches;
+      }
+    }
+  }
+  return matches;
+};
+const editFile = (p, target, replacement, replaceAll = false) => {
+  const current = readFile(p);
+  const t = String(target ?? "").replace(/\\r\\n/g, "\\n");
+  const r = String(replacement ?? "").replace(/\\r\\n/g, "\\n");
+  if (!t || !current.includes(t)) {
+    if (replaceAll && r && current.includes(r)) return current;
+    throw new Error("ERR_EDIT_TARGET_NOT_FOUND: Target not found in '" + normPath(p) + "'");
+  }
+  const updated = replaceAll ? current.split(t).join(r) : current.replace(t, r);
+  writeFile(p, updated);
+  return updated;
+};
+const fetchUrl = async (url, saveToPath) => {
+  const text = await __rpcFetchUrl(String(url ?? ""));
+  if (typeof saveToPath === "string" && saveToPath.trim()) {
+    writeFile(saveToPath, text);
+  }
+  return text;
+};
+const tools = Object.freeze({
+  workspace: Object.freeze({
+    readFile,
+    writeFile,
+    listFiles,
+    searchFiles,
+    search: searchFiles,
+    editFile,
+  }),
+  web: Object.freeze({
+    fetchUrl,
+    fetch_url: fetchUrl,
+  }),
+});
 const scriptConsole = {
   log: (...a) => logs.push(fmt(a)),
   info: (...a) => logs.push(fmt(a)),
   warn: (...a) => logs.push(fmt(a)),
   error: (...a) => logs.push(fmt(a)),
 };
-const result = await (async function(files, readFile, writeFile, console) {
+const result = await (async function(files, readFile, writeFile, console, tools, listFiles, searchFiles, editFile, fetchUrl) {
   "use strict";
-  return await (__runUserScript(files, readFile, writeFile, console));
-})(files, readFile, writeFile, scriptConsole);
+  return await (__runUserScript(files, readFile, writeFile, console, tools, listFiles, searchFiles, editFile, fetchUrl));
+})(files, readFile, writeFile, scriptConsole, tools, listFiles, searchFiles, editFile, fetchUrl);
 for (const [k, v] of Object.entries(files)) {
   if (typeof v === "string" && initialSnapshot[k] !== v) {
     stagedUpdates[normPath(k)] = v;
@@ -1493,6 +1695,14 @@ export function buildIsolatedWorkerBootstrapSource(): string {
 const __postToHost = self.postMessage.bind(self);
 const __origSetTimeout = self.setTimeout.bind(self);
 const __origSetInterval = self.setInterval.bind(self);
+const __pendingRpcs = new Map();
+let __rpcSeq = 0;
+let __started = false;
+const __rpcFetchUrl = (url) => new Promise((resolve, reject) => {
+  const rpcId = ++__rpcSeq;
+  __pendingRpcs.set(rpcId, { resolve, reject });
+  __postToHost({ rpc: "fetch_url", rpcId, url: String(url ?? "") });
+});
 const __BLOCKED = ${JSON.stringify(WORKER_SCRUBBED_GLOBALS)};
 let __proto = self;
 while (__proto && __proto !== Object.prototype) {
@@ -1507,13 +1717,27 @@ for (const k of __BLOCKED) {
   } catch {}
 }
 self.onmessage = async (ev) => {
-  self.onmessage = null;
+  const msg = ev.data;
+  if (msg && typeof msg.rpcId === "number") {
+    const pending = __pendingRpcs.get(msg.rpcId);
+    if (pending) {
+      __pendingRpcs.delete(msg.rpcId);
+      if (msg.ok) pending.resolve(String(msg.text ?? ""));
+      else pending.reject(new Error(String(msg.error ?? "ERR_FETCH_FAILED")));
+    }
+    return;
+  }
+  if (__started) return;
+  __started = true;
   try {
-    const { code, initialFilesJson } = ev.data;
+    const { code, initialFilesJson } = msg;
     const AsyncFn = Object.getPrototypeOf(async function(){}).constructor;
     const GenFn = Object.getPrototypeOf(function*(){}).constructor;
     const AsyncGenFn = Object.getPrototypeOf(async function*(){}).constructor;
-    const __runUserScript = new AsyncFn("files", "readFile", "writeFile", "console", "'use strict';\\n" + code);
+    const __runUserScript = new AsyncFn(
+      "files", "readFile", "writeFile", "console", "tools", "listFiles", "searchFiles", "editFile", "fetchUrl",
+      "'use strict';\\n" + code
+    );
     const blockedCtor = () => { throw new Error("ERR_SCRIPT_SANDBOX_VIOLATION: Dynamic code generation is disabled"); };
     for (const proto of [Function.prototype, AsyncFn.prototype, GenFn.prototype, AsyncGenFn.prototype]) {
       try { Object.defineProperty(proto, "constructor", { value: blockedCtor, writable: false, configurable: false }); } catch {}
@@ -1576,6 +1800,24 @@ function createProtectedScriptWorker(): Worker {
   return new Worker(`${browserOrigin}/api/sandbox/worker.js`);
 }
 
+async function handleWorkerFetchRpc(
+  worker: Worker,
+  rpcId: number,
+  rawUrl: unknown,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const text = await executeHostValidatedTextFetch(rawUrl, signal);
+    worker.postMessage({ rpcId, ok: true, text });
+  } catch (err) {
+    worker.postMessage({
+      rpcId,
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function runScriptInBrowserWorker(
   code: string,
   initialFiles: Record<string, string>,
@@ -1607,6 +1849,10 @@ async function runScriptInBrowserWorker(
         workerReady = true;
         return;
       }
+      if (data?.rpc === "fetch_url" && typeof data.rpcId === "number") {
+        void handleWorkerFetchRpc(worker, data.rpcId, data.url, signal);
+        return;
+      }
       cleanup();
       try {
         resolve(decodeScriptWorkerResult(data));
@@ -1630,16 +1876,22 @@ async function runScriptInBrowserWorker(
 async function runScriptInNodeVm(
   code: string,
   initialFiles: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<IsolatedScriptExecutionResult> {
   const vm = await import("node:vm");
-  const context = vm.createContext(Object.create(null), {
+  const contextBridge = Object.create(null) as Record<string, unknown>;
+  contextBridge.__hostFetchUrl = (rawUrl: unknown) =>
+    executeHostValidatedTextFetch(rawUrl, signal);
+  const context = vm.createContext(contextBridge, {
     codeGeneration: { strings: false, wasm: false },
   });
   const escapedFilesJson = JSON.stringify(JSON.stringify(initialFiles));
   const fullVmSource = `(async () => {
     "use strict";
+    const __rpcFetchUrl = __hostFetchUrl;
+    delete globalThis.__hostFetchUrl;
     const __initialFilesJson = ${escapedFilesJson};
-    const __runUserScript = async function(files, readFile, writeFile, console) {
+    const __runUserScript = async function(files, readFile, writeFile, console, tools, listFiles, searchFiles, editFile, fetchUrl) {
       "use strict";
       ${code}
     };
@@ -1690,7 +1942,7 @@ async function executeIsolatedWorkspaceScript(
   assertNoDynamicImportSyntax(code);
   const isNodeEnv =
     typeof process !== "undefined" && Boolean(process.versions?.node);
-  if (isNodeEnv) return runScriptInNodeVm(code, initialFiles);
+  if (isNodeEnv) return runScriptInNodeVm(code, initialFiles, signal);
   if (typeof Worker === "function") return runScriptInBrowserWorker(code, initialFiles, signal);
   throw new Error("ERR_SCRIPT_SANDBOX_UNAVAILABLE: Browser Workers are required.");
 }
@@ -1699,7 +1951,7 @@ const runWorkspaceScriptTool: RegisteredBrowserTool = {
   spec: {
     name: "workspace.run_script",
     description:
-      "Execute a JavaScript calculation or data-processing script against workspace files in an isolated standard JS sandbox (no Node require/fs or external npm packages). Provides `files` (path -> text map), `readFile(path)`, `writeFile(path, data)`, and `console.log(...)`.",
+      "Execute a JavaScript calculation or multi-step Code Mode (Programmatic Tool Calling) script in an isolated JS sandbox. Provides `files`, `readFile(path)`, `writeFile(path, data)`, `listFiles(prefix?)`, `searchFiles(query, pathFilter?)`, `editFile(path, target, replacement, replaceAll?)`, `await fetchUrl(url, saveToPath?)` (also available under `tools.workspace.*` and `tools.web.fetchUrl`), and `console.log(...)`.",
     effectClass: "idempotent_write",
     requiresApproval: false,
     parametersSchema: {
@@ -1770,7 +2022,7 @@ export function createImageGenerationTools(
         required: ["outputPath", "prompt"],
       },
     },
-    async handler(args, _store, signal) {
+    async handler(args, _store, signal, context) {
       const outputPath = assertSafeWorkspacePath(args.outputPath ?? args.path);
       const prompt = nonEmptyString(args.prompt);
       if (!prompt) {
@@ -1778,6 +2030,7 @@ export function createImageGenerationTools(
       }
       const style = nonEmptyString(args.style) ?? "game-asset";
       const generated = await provider.generateOrTransform({
+        runId: context?.runId,
         prompt,
         style,
         signal,
@@ -1811,7 +2064,7 @@ export function createImageGenerationTools(
         required: ["sourcePath", "outputPath", "prompt"],
       },
     },
-    async handler(args, store, signal) {
+    async handler(args, store, signal, context) {
       const sourcePath = assertSafeWorkspacePath(args.sourcePath);
       const outputPath = assertSafeWorkspacePath(args.outputPath);
       const prompt = nonEmptyString(args.prompt);
@@ -1821,6 +2074,7 @@ export function createImageGenerationTools(
       const sourceRaw = await store.readFileTextOrDataUrl(sourcePath);
       const style = nonEmptyString(args.style) ?? "flux-4b-lora";
       const transformed = await provider.generateOrTransform({
+        runId: context?.runId,
         prompt: `${prompt} [source:${sourcePath}]`,
         sourceDataUrl: sourceRaw,
         style,
@@ -1984,7 +2238,7 @@ export function createSubagentTools(
 }
 
 export function createDefaultWorkspaceTools(
-  modelConfigProvider?: () => ProviderModelConfig | undefined,
+  modelConfigProvider?: (runId?: string) => ProviderModelConfig | undefined,
   serviceConfigProvider?: () => ServiceCapabilitiesConfigSpec | undefined,
 ): RegisteredBrowserTool[] {
   const imgProvider = modelConfigProvider
@@ -2037,6 +2291,22 @@ export class BrowserToolRegistry implements ToolExecutionAdapter {
       throw new Error("ERR_TOOL_INVALID_NAME: Tool name cannot be empty");
     }
     this.tools.set(tool.spec.name, tool);
+  }
+
+  public forkForStore(
+    targetStore: WorkspaceKernelStore,
+    workspaceTools?: readonly RegisteredBrowserTool[],
+  ): BrowserToolRegistry {
+    const nonSubagentTools = workspaceTools ?? Array.from(this.tools.values()).filter(
+      (t) => t.spec.name !== "agent.delegate" && t.spec.name !== "agent.spawn",
+    );
+    const forked = new BrowserToolRegistry(
+      targetStore,
+      nonSubagentTools,
+      this.fallbackGateway,
+    );
+    forked.registerGatewayToolSpecs(Array.from(this.remoteToolSpecs.values()));
+    return forked;
   }
 
   /**

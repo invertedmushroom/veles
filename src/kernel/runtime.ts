@@ -18,6 +18,7 @@ import {
 } from "../inference/openai-compatible.ts";
 import {
   DEFAULT_SERVICE_CAPABILITIES_CONFIG,
+  type ContextEconomicsSummary,
   type GatewayInstanceId,
   type OperationId,
   type RunId,
@@ -35,8 +36,14 @@ import {
   VelesHarnessRouter,
   type InBrowserSpecialistProfile,
   type OptionalClassifierAdapter,
+  type SpecialistRoutingResult,
 } from "./harness-router.ts";
 import type { WorkspaceKernelStore } from "./journal.ts";
+import {
+  boundWorkspaceFileSignature,
+  MAX_WORKSPACE_SIGNATURE_CHARS,
+  WorkspaceFileSignatureCollector,
+} from "./workspace-intelligence.ts";
 
 export interface ToolExecutionRequest {
   readonly runId: RunId;
@@ -52,6 +59,11 @@ export interface ToolExecutionOutcome {
   readonly outputText: string;
   readonly fileUpdates?: Readonly<Record<string, Uint8Array | string | null>>;
   readonly imageDataUrls?: readonly string[];
+}
+
+interface ToolCallLoopObservation {
+  readonly workspaceVersion: string | null;
+  readonly count: number;
 }
 
 export interface ToolExecutionAdapter {
@@ -104,6 +116,8 @@ export interface ContextBuildOptions {
   readonly hotRunWindow?: number;
   /** Current workspace file tree (path -> sha256) injected as Layer 1 system context. */
   readonly fileTree?: Readonly<Record<string, string>>;
+  /** Optional structural signatures per file path (CSV columns, JSON keys, HTML IDs, JS fns). */
+  readonly fileSignatures?: Readonly<Record<string, string>>;
   /** Matched Layer 2 in-browser specialist capsules injected into the system prompt. */
   readonly specialistCapsules?: readonly InBrowserSpecialistProfile[];
   /** Optional character budget (~4 chars per token; default 48_000 chars ~ 12k tokens). */
@@ -123,6 +137,43 @@ export interface AgentKernelRuntimeOptions {
   readonly hotRunWindow?: number;
   readonly router?: VelesHarnessRouter;
   readonly classifier?: OptionalClassifierAdapter;
+}
+
+interface RoundRoutingCacheEntry {
+  readonly result: SpecialistRoutingResult;
+  readonly attemptCount: number;
+}
+
+interface ResolvedRoundRouting extends RoundRoutingCacheEntry {
+  readonly cacheHit: boolean;
+}
+
+const STATIC_SYSTEM_CONTRACT_LINES = [
+  "You are the Veles Browser-Native Agent.",
+  "Workspace folders: `preview/` (live HTML/CSS/JS/SVG rendered in sandbox), `assets/` (images/media), `scripts/` (CLI/gateway scripts), `notes/` (plans/memory).",
+  "Preview sandbox (`origin === \"null\"`): `localStorage`/`sessionStorage` are blocked; `window.veles` provides `kv.get(k)`, `kv.set(k, v)`, `kv.remove(k)`, `log(msg, detail?)`, and `sensors.latest` / `sensors.onUpdate(cb)`.",
+  "kv.get(k) returns a value or null synchronously (do not use top-level await in classic <script> tags or call .then() on kv.get). Keep the real host bridge intact.",
+] as const;
+
+interface ContextMessageOrigin {
+  readonly runId: RunId;
+  readonly foldedSavedChars: number;
+}
+
+/** Provenance stays outside ChatMessage so it cannot enter the inference wire format. */
+interface CompiledContext {
+  readonly messages: ChatMessage[];
+  readonly origins: Map<ChatMessage, ContextMessageOrigin>;
+  readonly hotRunIds: ReadonlySet<RunId>;
+  readonly supersededSeqs: ReadonlySet<number>;
+}
+
+interface ToolStepObservation {
+  readonly intentSeq: number;
+  readonly resultSeq: number | null;
+  readonly toolName: string;
+  readonly path: string | null;
+  readonly isError: boolean;
 }
 
 /**
@@ -147,21 +198,39 @@ export class ContextBuilder {
     runIdOrOptions?: RunId | ContextBuildOptions,
   ): ChatMessage[] {
     const opts = ContextBuilder.normalizeOptions(runIdOrOptions);
+    return ContextBuilder.compileContext(records, opts).messages;
+  }
+
+  public static buildContext(
+    records: readonly RunJournalRecord[],
+    runIdOrOptions?: RunId | ContextBuildOptions,
+  ): { messages: ChatMessage[]; economics: ContextEconomicsSummary } {
+    const opts = ContextBuilder.normalizeOptions(runIdOrOptions);
+    const compiled = ContextBuilder.compileContext(records, opts);
+    return {
+      messages: compiled.messages,
+      economics: ContextBuilder.measureCompiledContext(compiled, opts),
+    };
+  }
+
+  private static compileContext(
+    records: readonly RunJournalRecord[],
+    opts: ContextBuildOptions,
+  ): CompiledContext {
     const { runOrder, byRun } = ContextBuilder.groupRecordsByRun(records, opts);
     const hotRunIds = ContextBuilder.selectHotRunIds(
       runOrder,
       byRun,
       opts.hotRunWindow,
     );
-    const messages: ChatMessage[] = [];
-
-    const sysHeader = ContextBuilder.formatWorkspaceHeader(
-      opts.fileTree,
-      opts.specialistCapsules,
+    const supersededSeqs = ContextBuilder.collectSupersededRecordSeqs(
+      runOrder,
+      byRun,
     );
-    if (sysHeader !== null) {
-      messages.push({ role: "system", content: sysHeader });
-    }
+    const compiled: CompiledContext = {
+      messages: [], origins: new Map(), hotRunIds, supersededSeqs,
+    };
+    const messages = compiled.messages;
 
     for (let i = 0; i < runOrder.length; i++) {
       const rId = runOrder[i]!;
@@ -169,23 +238,168 @@ export class ContextBuilder {
       if (i < runOrder.length - 1 && ContextBuilder.isEmptyInterruptedRun(recs)) {
         continue;
       }
-      const isHot = hotRunIds.has(rId);
       const committedCallIds = ContextBuilder.collectCommittedToolCallIds(recs);
       for (const rec of recs) {
-        ContextBuilder.appendRecordMessage(
-          messages,
-          rec,
-          isHot,
-          opts.fileTree,
-          committedCallIds,
+        ContextBuilder.appendTrackedRecord(
+          compiled, rec, opts.fileTree, committedCallIds,
         );
       }
     }
 
-    if (opts.maxCharBudget !== undefined) {
-      return ContextBuilder.enforceCharBudget(messages, opts.maxCharBudget);
+    const activeStart = ContextBuilder.findLastUserTurnIndex(messages, 0);
+    const activePrompt = activeStart >= 0 ? (messages[activeStart]?.content ?? "") : "";
+    const activeChars = ContextBuilder.totalMessageChars(
+      messages.slice(Math.max(0, activeStart)),
+    );
+    const headerBudget = opts.maxCharBudget === undefined
+      ? Infinity
+      : Math.max(0, opts.maxCharBudget - activeChars);
+    const sysHeader = ContextBuilder.formatWorkspaceHeader(
+      opts.fileTree, opts.specialistCapsules, opts.fileSignatures,
+      headerBudget, activePrompt,
+    );
+    if (sysHeader !== null) messages.unshift({ role: "system", content: sysHeader });
+    return {
+      ...compiled,
+      messages: opts.maxCharBudget === undefined
+        ? messages
+        : ContextBuilder.enforceCharBudget(messages, opts.maxCharBudget),
+    };
+  }
+
+  private static appendTrackedRecord(
+    compiled: CompiledContext,
+    rec: RunJournalRecord,
+    liveFileTree: Readonly<Record<string, string>> | undefined,
+    committedCallIds: ReadonlySet<string>,
+  ): void {
+    const isSuperseded = compiled.supersededSeqs.has(rec.seq);
+    const isHot = compiled.hotRunIds.has(rec.runId) && !isSuperseded;
+    const emitted: ChatMessage[] = [];
+    ContextBuilder.appendRecordMessage(
+      emitted, rec, isHot, liveFileTree, committedCallIds, isSuperseded,
+    );
+    let savedChars = 0;
+    if (!isHot) {
+      const unfolded: ChatMessage[] = [];
+      ContextBuilder.appendRecordMessage(
+        unfolded, rec, true, liveFileTree, committedCallIds, false,
+      );
+      savedChars = Math.max(
+        0,
+        ContextBuilder.totalMessageChars(unfolded) - ContextBuilder.totalMessageChars(emitted),
+      );
     }
-    return messages;
+    for (const message of emitted) {
+      compiled.origins.set(message, {
+        runId: rec.runId, foldedSavedChars: savedChars,
+      });
+      savedChars = 0;
+      compiled.messages.push(message);
+    }
+  }
+
+  private static extractToolRecordPath(p: Record<string, unknown>): string | null {
+    const args =
+      typeof p.args === "object" && p.args !== null
+        ? (p.args as Record<string, unknown>)
+        : null;
+    if (!args) return null;
+    for (const k of ["path", "saveToPath", "outputPath", "saveResultToPath"]) {
+      if (typeof args[k] === "string" && args[k].trim()) {
+        return args[k].trim();
+      }
+    }
+    return null;
+  }
+
+  private static isStepSupersededByLater(
+    earlier: ToolStepObservation,
+    later: ToolStepObservation,
+  ): boolean {
+    if (later.resultSeq === null || later.isError) return false;
+    if (earlier.path !== null && earlier.path === later.path) {
+      return (
+        earlier.isError ||
+        earlier.toolName === "workspace.write_file" ||
+        earlier.toolName === "workspace.read_file"
+      );
+    }
+    return earlier.isError && earlier.path === null && earlier.toolName === later.toolName;
+  }
+
+  private static collectSupersededRecordSeqs(
+    runOrder: readonly RunId[],
+    byRun: ReadonlyMap<RunId, readonly RunJournalRecord[]>,
+  ): Set<number> {
+    const resultsByCallId = new Map<string, RunJournalRecord>();
+    const intents: RunJournalRecord[] = [];
+    for (const rId of runOrder) {
+      for (const rec of byRun.get(rId) ?? []) {
+        if (rec.type === "ToolResultCommitted" && typeof rec.payload.toolCallId === "string") {
+          resultsByCallId.set(ContextBuilder.toolStepKey(rec), rec);
+        } else if (rec.type === "ToolIntentLogged") {
+          intents.push(rec);
+        }
+      }
+    }
+    const steps: ToolStepObservation[] = intents.map((rec) => {
+      const resRec = resultsByCallId.get(ContextBuilder.toolStepKey(rec));
+      const out = String(resRec?.payload.outputText ?? "");
+      return {
+        intentSeq: rec.seq,
+        resultSeq: resRec?.seq ?? null,
+        toolName: String(rec.payload.toolName ?? ""),
+        path: ContextBuilder.extractToolRecordPath(rec.payload),
+        isError: out.startsWith("ToolError (") || out.startsWith("LOOP_GUARD_TRIGGERED:"),
+      };
+    });
+    const superseded = new Set<number>();
+    for (let i = 0; i < steps.length; i++) {
+      const cur = steps[i]!;
+      if (steps.slice(i + 1).some((later) => ContextBuilder.isStepSupersededByLater(cur, later))) {
+        superseded.add(cur.intentSeq);
+        if (cur.resultSeq !== null) superseded.add(cur.resultSeq);
+      }
+    }
+    return superseded;
+  }
+
+  private static toolStepKey(rec: RunJournalRecord): string {
+    return JSON.stringify([rec.runId, rec.relatedOperationId ?? rec.payload.toolCallId]);
+  }
+
+  private static hasSuccessfulToolOutput(
+    recs: readonly RunJournalRecord[],
+  ): boolean {
+    return recs.some((r) => {
+      if (r.type !== "ToolResultCommitted") return false;
+      const out = String(r.payload.outputText ?? "");
+      return !out.startsWith("ToolError (") && !out.startsWith("LOOP_GUARD_TRIGGERED:");
+    });
+  }
+
+  private static promoteLastSuccessfulRunIntoHotWindow(
+    runOrder: readonly RunId[],
+    byRun: ReadonlyMap<RunId, readonly RunJournalRecord[]>,
+    hot: Set<RunId>,
+    windowSize: number,
+  ): void {
+    if (windowSize < 2 || runOrder.length <= windowSize) return;
+    const latestRunId = runOrder.at(-1);
+    const priorHotIds = Array.from(hot).filter((id) => id !== latestRunId);
+    if (priorHotIds.some((id) => ContextBuilder.hasSuccessfulToolOutput(byRun.get(id) ?? []))) {
+      return;
+    }
+    for (let i = runOrder.length - 2; i >= 0; i--) {
+      const candidateId = runOrder[i]!;
+      if (hot.has(candidateId)) continue;
+      if (ContextBuilder.hasSuccessfulToolOutput(byRun.get(candidateId) ?? [])) {
+        if (priorHotIds[0]) hot.delete(priorHotIds[0]);
+        hot.add(candidateId);
+        return;
+      }
+    }
   }
 
   private static selectHotRunIds(
@@ -219,6 +433,12 @@ export class ContextBuilder {
         substantiveRunsKept += 1;
       }
     }
+    ContextBuilder.promoteLastSuccessfulRunIntoHotWindow(
+      runOrder,
+      byRun,
+      hot,
+      windowSize,
+    );
     return hot;
   }
 
@@ -308,43 +528,221 @@ export class ContextBuilder {
     return allowed;
   }
 
+  private static formatTreeEntryLine(
+    path: string,
+    hash: string,
+    signature: string,
+  ): string {
+    return `  - ${path} [sha256:${hash.slice(0, 8)}]${signature}`;
+  }
+
+  private static formatSpecialistBlock(
+    capsules?: readonly InBrowserSpecialistProfile[],
+  ): string {
+    if (!capsules || capsules.length === 0) return "";
+    return [
+      "--- Active In-Browser Specialist Guidance ---",
+      ...capsules.map((cap) => cap.capsulePrompt),
+    ].join("\n");
+  }
+
+  private static scorePathSalience(path: string, promptLower: string): number {
+    const base = path.split("/").pop()?.toLowerCase() ?? path.toLowerCase();
+    if (
+      promptLower &&
+      (promptLower.includes(path.toLowerCase()) ||
+        (base.length > 3 && promptLower.includes(base)))
+    ) {
+      return 0;
+    }
+    if (path === "preview/index.html") return 1;
+    if (path.startsWith("preview/")) return 2;
+    if (path.startsWith("scripts/")) return 3;
+    if (path.startsWith("assets/")) return 4;
+    return 5;
+  }
+
+  private static formatWorkspaceTreeBlock(
+    fileTree?: Readonly<Record<string, string>>,
+    fileSignatures?: Readonly<Record<string, string>>,
+    signatureCharBudget = MAX_WORKSPACE_SIGNATURE_CHARS,
+    activePrompt = "",
+  ): string {
+    const resolvedTree = fileTree ?? {};
+    const paths = Object.keys(resolvedTree).sort();
+    const promptLower = activePrompt.toLowerCase();
+    const rankedPaths = [...paths].sort(
+      (a, b) =>
+        ContextBuilder.scorePathSalience(a, promptLower) -
+          ContextBuilder.scorePathSalience(b, promptLower) ||
+        a.localeCompare(b),
+    );
+    const allocated = new Map<string, string>();
+    let remaining = signatureCharBudget;
+    for (const path of rankedPaths) {
+      const raw = fileSignatures?.[path];
+      const suffix = raw ? ` (${boundWorkspaceFileSignature(raw)})` : "";
+      const signature = suffix.length <= remaining ? suffix : "";
+      remaining -= signature.length;
+      allocated.set(path, signature);
+    }
+    const lines = paths.map((path) =>
+      ContextBuilder.formatTreeEntryLine(
+        path,
+        resolvedTree[path]!,
+        allocated.get(path) ?? "",
+      ),
+    );
+    const treeLines = lines.length === 0 ? "  (empty workspace)" : lines.join("\n");
+    return `Current Committed OPFS Workspace Tree:\n${treeLines}`;
+  }
+
+  /**
+   * Orders system context from most-static to most-volatile for LLM Prompt Caching:
+   * 1) Static Veles System Contract (100% invariant across sessions)
+   * 2) Run-Stable Specialist Capsules (invariant across all tool rounds of a run)
+   * 3) Live OPFS Workspace Tree + Signatures (updates only when files change)
+   */
   private static formatWorkspaceHeader(
     fileTree?: Readonly<Record<string, string>>,
     capsules?: readonly InBrowserSpecialistProfile[],
+    fileSignatures?: Readonly<Record<string, string>>,
+    maxHeaderChars = Infinity,
+    activePrompt = "",
   ): string | null {
     const hasCapsules = Boolean(capsules && capsules.length > 0);
     if (!fileTree && !hasCapsules) {
       return null;
     }
-    const resolvedTree = fileTree ?? {};
-    const paths = Object.keys(resolvedTree).sort();
-    const treeLines =
-      paths.length === 0
-        ? "  (empty workspace)"
-        : paths
-            .map((p) => `  - ${p} [sha256:${resolvedTree[p]!.slice(0, 8)}]`)
-            .join("\n");
-    const lines = [
-      "You are the Veles Browser-Native Agent.",
-      "Workspace folders: `preview/` (live HTML/CSS/JS/SVG rendered in sandbox), `assets/` (images/media), `scripts/` (CLI/gateway scripts), `notes/` (plans/memory).",
-      "Preview sandbox (`origin === \"null\"`): `localStorage`/`sessionStorage` are blocked; `window.veles` provides `kv.get(k)`, `kv.set(k, v)`, `kv.remove(k)`, `log(msg, detail?)`, and `sensors.latest` / `sensors.onUpdate(cb)`.",
-      "kv.get(k) returns a value or null synchronously (do not use top-level await in classic <script> tags or call .then() on kv.get). Keep the real host bridge intact.",
-      "Current Committed OPFS Workspace Tree:",
-      treeLines,
-    ];
-    if (capsules && capsules.length > 0) {
-      lines.push("", "--- Active In-Browser Specialist Guidance ---");
-      for (const cap of capsules) {
-        lines.push(cap.capsulePrompt);
+    const sections: string[] = [STATIC_SYSTEM_CONTRACT_LINES.join("\n")];
+    const specialistBlock = ContextBuilder.formatSpecialistBlock(capsules);
+    if (specialistBlock) {
+      sections.push(specialistBlock);
+    }
+    const bareTree = ContextBuilder.formatWorkspaceTreeBlock(fileTree);
+    const bareHeaderChars = [...sections, bareTree].join("\n\n").length;
+    const signatureBudget = Math.max(
+      0, Math.min(MAX_WORKSPACE_SIGNATURE_CHARS, maxHeaderChars - bareHeaderChars),
+    );
+    sections.push(ContextBuilder.formatWorkspaceTreeBlock(
+      fileTree, fileSignatures, signatureBudget, activePrompt,
+    ));
+    return sections.join("\n\n");
+  }
+
+  private static tallyNonSystemMessages(messages: readonly ChatMessage[]): {
+    conversationChars: number;
+    toolIOChars: number;
+    imageWeightChars: number;
+  } {
+    let conversationChars = 0;
+    let toolIOChars = 0;
+    let imageWeightChars = 0;
+    for (const m of messages) {
+      if (m.role === "system") continue;
+      imageWeightChars +=
+        m.imageDataUrls?.reduce((s, u) => s + Math.min(u.length, 4000), 0) ?? 0;
+      if (m.role === "tool") {
+        toolIOChars += m.content.length;
+      } else if (m.role === "assistant" && m.toolCalls?.length) {
+        conversationChars += m.content.length;
+        toolIOChars += m.toolCalls.reduce(
+          (s, tc) => s + tc.name.length + tc.argumentsJson.length,
+          0,
+        );
+      } else {
+        conversationChars += m.content.length;
       }
     }
-    return lines.join("\n");
+    return { conversationChars, toolIOChars, imageWeightChars };
+  }
+
+  private static tallyHotAndColdRunFolding(
+    compiled: CompiledContext,
+  ): {
+    hotRunCount: number;
+    coldFoldedRunCount: number;
+    foldedSavedChars: number;
+  } {
+    const hotRuns = new Set<RunId>();
+    const coldRuns = new Set<RunId>();
+    let foldedSavedChars = 0;
+    for (const message of compiled.messages) {
+      const origin = compiled.origins.get(message);
+      if (!origin) continue;
+      const runs = compiled.hotRunIds.has(origin.runId) ? hotRuns : coldRuns;
+      runs.add(origin.runId);
+      foldedSavedChars += origin.foldedSavedChars;
+    }
+    return {
+      hotRunCount: hotRuns.size,
+      coldFoldedRunCount: coldRuns.size,
+      foldedSavedChars,
+    };
+  }
+
+  public static measureContextEconomics(
+    records: readonly RunJournalRecord[],
+    runIdOrOptions?: RunId | ContextBuildOptions,
+  ): ContextEconomicsSummary {
+    return ContextBuilder.buildContext(records, runIdOrOptions).economics;
+  }
+
+  private static measureCompiledContext(
+    compiled: CompiledContext,
+    opts: ContextBuildOptions,
+  ): ContextEconomicsSummary {
+    const messages = compiled.messages;
+    const sysHeader = messages.find((message) => message.role === "system")?.content ?? "";
+    const hasSysHeader = sysHeader.length > 0;
+    const systemContractChars = hasSysHeader
+      ? STATIC_SYSTEM_CONTRACT_LINES.join("\n").length
+      : 0;
+    const specialistCapsuleChars = hasSysHeader
+      ? ContextBuilder.formatSpecialistBlock(opts.specialistCapsules).length
+      : 0;
+    const treeStart = sysHeader.indexOf("Current Committed OPFS Workspace Tree:");
+    const workspaceTreeChars = treeStart >= 0 ? sysHeader.length - treeStart : 0;
+    const { conversationChars, toolIOChars, imageWeightChars } =
+      ContextBuilder.tallyNonSystemMessages(messages);
+    const { hotRunCount, coldFoldedRunCount, foldedSavedChars } =
+      ContextBuilder.tallyHotAndColdRunFolding(compiled);
+    const totalChars =
+      sysHeader.length +
+      conversationChars +
+      toolIOChars +
+      imageWeightChars;
+    return {
+      systemContractChars,
+      specialistCapsuleChars,
+      workspaceTreeChars,
+      conversationChars,
+      toolIOChars,
+      imageWeightChars,
+      totalChars,
+      estimatedTokens: Math.ceil(totalChars / 4),
+      cacheablePrefixTokens: Math.ceil(
+        (systemContractChars + specialistCapsuleChars) / 4,
+      ),
+      foldedSavedChars,
+      hotRunCount,
+      coldFoldedRunCount,
+    };
   }
 
   private static messageCharWeight(m: ChatMessage): number {
     const imgWeight =
       m.imageDataUrls?.reduce((s, u) => s + Math.min(u.length, 4000), 0) ?? 0;
-    return m.content.length + imgWeight;
+    const toolWeight = m.toolCalls?.reduce(
+      (sum, call) => sum + call.name.length + call.argumentsJson.length, 0,
+    ) ?? 0;
+    return m.content.length + imgWeight + toolWeight;
+  }
+
+  private static totalMessageChars(messages: readonly ChatMessage[]): number {
+    return messages.reduce(
+      (sum, message) => sum + ContextBuilder.messageCharWeight(message), 0,
+    );
   }
 
   private static enforceCharBudget(
@@ -417,12 +815,33 @@ export class ContextBuilder {
     );
   }
 
+  private static compactToolArgs(
+    rawArgs: Record<string, unknown>,
+    isHotRun: boolean,
+  ): Record<string, unknown> {
+    if (isHotRun) return rawArgs;
+    if (typeof rawArgs.content === "string" && rawArgs.content.length > 120) {
+      return {
+        ...rawArgs,
+        content: `<folded ${rawArgs.content.length} chars; read from OPFS if needed>`,
+      };
+    }
+    if (Array.isArray(rawArgs.edits) && JSON.stringify(rawArgs.edits).length > 160) {
+      return {
+        ...rawArgs,
+        edits: `<folded ${rawArgs.edits.length} edit(s); see current file in OPFS>`,
+      };
+    }
+    return rawArgs;
+  }
+
   private static appendRecordMessage(
     messages: ChatMessage[],
     rec: RunJournalRecord,
     isHotRun = true,
     liveFileTree?: Readonly<Record<string, string>>,
     committedCallIds?: ReadonlySet<string>,
+    isSuperseded = false,
   ): void {
     const p = rec.payload;
     if (rec.type === "RunCreated" && typeof p.prompt === "string") {
@@ -441,15 +860,7 @@ export class ContextBuilder {
         typeof p.args === "object" && p.args !== null
           ? (p.args as Record<string, unknown>)
           : {};
-      const compactArgs =
-        !isHotRun &&
-        typeof rawArgs.content === "string" &&
-        rawArgs.content.length > 120
-          ? {
-              ...rawArgs,
-              content: `<folded ${rawArgs.content.length} chars; read from OPFS if needed>`,
-            }
-          : rawArgs;
+      const compactArgs = ContextBuilder.compactToolArgs(rawArgs, isHotRun);
       ContextBuilder.appendToolIntentOrDenied(
         messages,
         rec.type,
@@ -461,7 +872,13 @@ export class ContextBuilder {
       return;
     }
     if (rec.type === "ToolResultCommitted" && typeof p.outputText === "string") {
-      ContextBuilder.appendToolResultRecord(messages, p, isHotRun, liveFileTree);
+      ContextBuilder.appendToolResultRecord(
+        messages,
+        p,
+        isHotRun,
+        liveFileTree,
+        isSuperseded,
+      );
       return;
     }
     if (rec.type === "RunCompleted" && typeof p.assistantText === "string") {
@@ -499,17 +916,39 @@ export class ContextBuilder {
     return notes.length > 0 ? `\n${notes.join("\n")}` : "";
   }
 
+  private static formatFoldedToolOutput(
+    rawText: string,
+    isHotRun: boolean,
+    isSuperseded: boolean,
+  ): string {
+    if (isHotRun) return rawText;
+    if (
+      isSuperseded &&
+      (rawText.startsWith("ToolError (") ||
+        rawText.startsWith("LOOP_GUARD_TRIGGERED:")) &&
+      rawText.length > 80
+    ) {
+      return `${rawText.slice(0, 64)}... [resolved in later step]`;
+    }
+    if (rawText.length > 200) {
+      return `${rawText.slice(0, 120)}... [folded ${rawText.length} chars]`;
+    }
+    return rawText;
+  }
+
   private static appendToolResultRecord(
     messages: ChatMessage[],
     p: Record<string, unknown>,
     isHotRun: boolean,
     liveFileTree?: Readonly<Record<string, string>>,
+    isSuperseded = false,
   ): void {
     const rawText = String(p.outputText ?? "");
-    const text =
-      !isHotRun && rawText.length > 200
-        ? `${rawText.slice(0, 120)}... [folded ${rawText.length} chars]`
-        : rawText;
+    const text = ContextBuilder.formatFoldedToolOutput(
+      rawText,
+      isHotRun,
+      isSuperseded,
+    );
     const driftNote = ContextBuilder.buildDriftAnnotation(
       p.observedFileHashes,
       liveFileTree,
@@ -675,6 +1114,9 @@ export class AgentKernelRuntime {
   private readonly listeners = new Set<(ev: WorkerRuntimeEvent) => void>();
   private readonly options: AgentKernelRuntimeOptions;
   private readonly router: VelesHarnessRouter;
+  private readonly signatureCollector = new WorkspaceFileSignatureCollector();
+  private readonly routingCache = new Map<string, RoundRoutingCacheEntry>();
+  private routingGeneration = 0;
   private readonly activeAborts = new Map<RunId, AbortController>();
   private readonly stopCommits = new Map<RunId, Promise<void>>();
   private serviceConfig: ServiceCapabilitiesConfigSpec =
@@ -718,6 +1160,11 @@ export class AgentKernelRuntime {
   }
 
   public setServiceConfig(config: ServiceCapabilitiesConfigSpec): void {
+    const decisionFields = ["mode", "endpointUrl", "model", "apiKey", "threshold", "timeoutMs"] as const;
+    if (decisionFields.some((field) => this.serviceConfig.decision[field] !== config.decision[field])) {
+      this.routingGeneration += 1;
+      this.routingCache.clear();
+    }
     this.serviceConfig = {
       ...config,
       decision: { ...config.decision },
@@ -743,7 +1190,39 @@ export class AgentKernelRuntime {
     this.tools.set(spec.name, spec);
   }
 
-  public getLatestModelConfig(): ProviderModelConfig | undefined {
+  public forkForStore(
+    targetStore: WorkspaceKernelStore,
+    forkToolAdapter?: (
+      adapter: ToolExecutionAdapter,
+      store: WorkspaceKernelStore,
+    ) => ToolExecutionAdapter,
+  ): AgentKernelRuntime {
+    const nextAdapter = forkToolAdapter
+      ? forkToolAdapter(this.toolAdapter, targetStore)
+      : (
+          this.toolAdapter as ToolExecutionAdapter & {
+            forkForStore?: (s: WorkspaceKernelStore) => ToolExecutionAdapter;
+          }
+        ).forkForStore?.(targetStore) ?? this.toolAdapter;
+    const nonSubagentDefs = Array.from(this.tools.values()).filter(
+      (t) => t.name !== "agent.delegate" && t.name !== "agent.spawn",
+    );
+    const forked = new AgentKernelRuntime(
+      targetStore,
+      this.inference,
+      nextAdapter,
+      nonSubagentDefs,
+      this.options,
+    );
+    forked.setServiceConfig(this.serviceConfig);
+    return forked;
+  }
+
+  public getLatestModelConfig(runId?: RunId): ProviderModelConfig | undefined {
+    if (runId !== undefined) {
+      const config = this.runConfigs.get(runId);
+      return config ? { ...config } : undefined;
+    }
     let latest: ProviderModelConfig | undefined;
     for (const cfg of this.runConfigs.values()) {
       latest = cfg;
@@ -1048,7 +1527,7 @@ export class AgentKernelRuntime {
         "",
         signal,
         runOpts.allowedTools,
-        new Map<string, number>(),
+        new Map<string, ToolCallLoopObservation>(),
       );
     }
     return "inferring";
@@ -1216,6 +1695,7 @@ export class AgentKernelRuntime {
     config: ProviderModelConfig,
     runOpts: StartRunOptions = {},
   ): Promise<void> {
+    const preRunFileTree = await this.store.getFileTree();
     await this.store.appendEvent({
       eventId: this.nextEventId(runId, "created"),
       runId,
@@ -1226,6 +1706,7 @@ export class AgentKernelRuntime {
         providerId: config.providerId,
         baseUrl: config.baseUrl,
         model: config.model,
+        preRunFileTree,
         ...(runOpts.sessionId ? { sessionId: runOpts.sessionId } : {}),
         ...(runOpts.parentSessionId ? { parentSessionId: runOpts.parentSessionId } : {}),
         ...(runOpts.allowedTools ? { allowedTools: [...runOpts.allowedTools] } : {}),
@@ -1254,6 +1735,32 @@ export class AgentKernelRuntime {
     this.emit({ type: "STATE_CHANGED", runId, state: "inferring" });
   }
 
+  private async resolveRoundRouting(
+    runId: RunId,
+    prompt: string,
+    filePaths: readonly string[],
+    configuredMode: string,
+    signal: AbortSignal,
+  ): Promise<ResolvedRoundRouting> {
+    const cacheKey = `${runId}\0${configuredMode}\0${prompt}\0${[...filePaths].sort().join("\0")}`;
+    const cached = this.routingCache.get(cacheKey);
+    // Retry one transient timeout on the next round, then retain the fallback.
+    if (cached && (cached.result.fallbackReason !== "timeout" || cached.attemptCount >= 2)) {
+      return { ...cached, cacheHit: true };
+    }
+    const generation = this.routingGeneration;
+    const routed = await this.router.routeWithOptionalClassifier(
+      prompt,
+      filePaths,
+      signal,
+    );
+    signal.throwIfAborted();
+    const entry = { result: routed, attemptCount: (cached?.attemptCount ?? 0) + 1 };
+    // Settings may have changed while the classifier request was in flight.
+    if (generation === this.routingGeneration) this.routingCache.set(cacheKey, entry);
+    return { ...entry, cacheHit: false };
+  }
+
   private async buildRoundMessages(
     runId: RunId,
     resolvedOpts: StartRunOptions,
@@ -1268,12 +1775,31 @@ export class AgentKernelRuntime {
           .find((r) => r.runId === runId && r.type === "RunCreated")?.payload
           .prompt ?? "";
       const configuredMode = this.serviceConfig.decision.mode;
-      const routed = await this.router.routeWithOptionalClassifier(
+      const { result: routed, cacheHit, attemptCount } = await this.resolveRoundRouting(
+        runId,
         String(latestPrompt),
         Object.keys(fileTree),
+        configuredMode,
         signal,
       );
       signal.throwIfAborted();
+      const fileSignatures = await this.signatureCollector.collect(
+        this.store,
+        fileTree,
+        signal,
+      );
+      signal.throwIfAborted();
+      const contextOpts: ContextBuildOptions = {
+        sessionId: resolvedOpts.sessionId,
+        fileTree,
+        fileSignatures,
+        specialistCapsules: routed.profiles,
+        hotRunWindow: this.options.hotRunWindow ?? 2,
+        maxCharBudget: 48_000,
+      };
+      const { messages, economics: contextEconomics } = ContextBuilder.buildContext(
+        journal, contextOpts,
+      );
       await this.store.appendEvent({
         eventId: this.nextEventId(runId, "harness-routing"),
         runId,
@@ -1284,17 +1810,14 @@ export class AgentKernelRuntime {
             source: routed.source,
             specialistIds: routed.profiles.map((p) => p.id),
             configuredMode,
+            cacheHit,
+            attemptCount,
             ...(routed.fallbackReason ? { fallbackReason: routed.fallbackReason } : {}),
           },
+          contextEconomics,
         },
       });
-      return ContextBuilder.buildMessages(journal, {
-        sessionId: resolvedOpts.sessionId,
-        fileTree,
-        specialistCapsules: routed.profiles,
-        hotRunWindow: this.options.hotRunWindow ?? 2,
-        maxCharBudget: 48_000,
-      });
+      return messages;
     }
     return ContextBuilder.buildMessages(journal, runId);
   }
@@ -1339,7 +1862,7 @@ export class AgentKernelRuntime {
   ): Promise<RunState> {
     const resolvedOpts = runOpts ?? this.runOptions.get(runId) ?? {};
     const maxToolRounds = 10;
-    const seenCallSignatures = new Map<string, number>();
+    const seenCallSignatures = new Map<string, ToolCallLoopObservation>();
 
     for (let round = 0; round < maxToolRounds; round++) {
       signal.throwIfAborted();
@@ -1399,15 +1922,20 @@ export class AgentKernelRuntime {
     assistantText: string,
     signal: AbortSignal,
     allowedTools: readonly string[] | undefined,
-    seenCallSignatures: Map<string, number>,
+    seenCallSignatures: Map<string, ToolCallLoopObservation>,
   ): Promise<RunState> {
     for (let i = 0; i < toolCalls.length; i++) {
       signal.throwIfAborted();
       const call = toolCalls[i]!;
       const textForCall = i === 0 ? assistantText : "";
       const callSig = `${call.name}:${call.argumentsJson.trim()}`;
-      const seenCount = (seenCallSignatures.get(callSig) ?? 0) + 1;
-      seenCallSignatures.set(callSig, seenCount);
+      const workspaceVersion = await awaitWithAbort(this.toolCallWorkspaceVersion(call), signal);
+      signal.throwIfAborted();
+      const previous = seenCallSignatures.get(callSig);
+      const seenCount = previous && previous.workspaceVersion === workspaceVersion
+        ? previous.count + 1
+        : 1;
+      seenCallSignatures.set(callSig, { workspaceVersion, count: seenCount });
 
       if (seenCount >= 2) {
         await this.recordRepeatedCallLoopGuard(runId, call, textForCall);
@@ -1428,6 +1956,21 @@ export class AgentKernelRuntime {
       }
     }
     return "inferring";
+  }
+
+  private async toolCallWorkspaceVersion(call: ToolCallSpec): Promise<string | null> {
+    if (!["workspace.read_file", "workspace.inspect_image", "workspace.list_files"].includes(call.name)) {
+      return null;
+    }
+    try {
+      const tree = await this.store.getFileTree();
+      if (call.name === "workspace.list_files") return JSON.stringify(Object.keys(tree).sort());
+      const path = String(parseToolArgs(call.argumentsJson).path ?? "").trim();
+      return JSON.stringify(tree[path] ?? null);
+    } catch {
+      // Duplicate detection must not prevent the tool's normal error recovery.
+      return null;
+    }
   }
 
   private async recordRepeatedCallLoopGuard(

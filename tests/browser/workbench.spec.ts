@@ -180,12 +180,17 @@ test.describe("Veles Browser Workbench E2E (Real Chromium Web Locks, IDB, OPFS, 
     await expect(page.getByRole("button", { name: "📁 Files (0)" })).toBeVisible();
     await page.getByRole("button", { name: "Close browser" }).click();
     await openWorkspacePanel(page, "project");
-    page.once("dialog", (dialog) => { void dialog.accept(archive); });
+    const picker = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "↧ Import project", exact: true }).click();
+    await (await picker).setFiles({ name: "project.json", mimeType: "application/json", buffer: Buffer.from(archive) });
     await expect(page.getByLabel("Switch Workspace").locator("option:checked")).toHaveText("Alpha");
     await page.getByRole("button", { name: /^📁 Files/ }).click();
     await expect(page.locator(".item-row", { hasText: "index.html" })).toBeVisible();
     await page.getByRole("button", { name: "Close browser" }).click();
+    page.once("dialog", (dialog) => { void dialog.dismiss(); });
+    await page.getByRole("button", { name: "Delete workspace", exact: true }).click();
+    await expect(page.getByLabel("Switch Workspace").locator("option:checked")).toHaveText("Alpha");
+    page.once("dialog", (dialog) => { void dialog.accept(); });
     await page.getByRole("button", { name: "Delete workspace", exact: true }).click();
     await expect(page.getByLabel("Switch Workspace")).toHaveValue(originalWorkspaceId);
 

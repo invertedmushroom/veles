@@ -129,6 +129,108 @@ function createGatewayFetch(gateway: EphemeralExecutionGateway) {
 }
 
 describe("SYS-UI & SYS-KERNEL Worker MessagePort Bridge, Release Journey, & All 10 Scenarios", () => {
+  for (const credentialScope of ["workspace", "session"] as const) {
+  it(`keeps background image and search calls bound to their originating run credentials across ${credentialScope}s`, async (t) => {
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((done) => { enter = done; });
+    const held = new Promise<void>((done) => { release = done; });
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const streamed = (chunk: unknown) => new Response(
+      `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`,
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+    t.mock.method(globalThis, "fetch", async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) return Response.json({ toolDefinitions: [] });
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        model?: string; messages?: Array<{ role: string }>;
+      };
+      if (url.endsWith("/chat/completions")) {
+        if (body.model === "model-a" && !body.messages?.some((m) => m.role === "tool")) {
+          enter();
+          await held;
+          return streamed({ choices: [{ delta: { tool_calls: [
+            { index: 0, id: "image-a", function: { name: "image__generate", arguments: JSON.stringify({ outputPath: "assets/a.png", prompt: "an A image" }) } },
+            { index: 1, id: "search-a", function: { name: "web__search", arguments: JSON.stringify({ query: "A query" }) } },
+          ] }, finish_reason: "tool_calls" }] });
+        }
+        return streamed({ choices: [{ delta: { content: "Done" }, finish_reason: "stop" }] });
+      }
+      requests.push({ url, authorization: new Headers(init?.headers).get("Authorization") });
+      if (url.endsWith("/images/generations")) return Response.json({ data: [{ b64_json: "AA==" }] });
+      return Response.json({ output_text: "A search result" });
+    });
+    const cfgA = { providerId: "openai", baseUrl: "https://provider-a.test/v1", model: "model-a", apiKey: "key-a" };
+    const ch = new MessageChannel();
+    const host = await bootBrowserKernelWorker(ch.port1, "ws-provider-a");
+    const client = new VelesAppClient(ch.port2, cfgA);
+    try {
+      await client.initWorkspace("A");
+      const services = client.getStateView().serviceConfig;
+      await client.updateServiceConfig({ ...services, decision: { ...services.decision, mode: "tier0-only" } });
+      const cfgB = { ...cfgA, baseUrl: "https://provider-b.test/v1", model: "model-b", apiKey: "key-b" };
+      if (credentialScope === "session") {
+        await client.createSession({ id: "provider-a", workspaceId: "ws-provider-a", model: cfgA, allowedTools: ["image.generate", "web.search"], status: "idle" });
+        await client.createSession({ id: "provider-b", workspaceId: "ws-provider-a", model: cfgB, allowedTools: [], status: "idle" });
+      }
+      const backgroundRun = credentialScope === "workspace"
+        ? client.startRun("provider-a-run", "Generate and search", cfgA)
+        : host.agentManager.runWithId("provider-a", "Generate and search", "provider-a-run");
+      await entered;
+      if (credentialScope === "workspace") {
+        await client.switchWorkspace("ws-provider-b", "B");
+        await client.startRun("provider-b-run", "Finish", cfgB);
+      } else {
+        await host.agentManager.runWithId("provider-b", "Finish", "provider-b-run");
+      }
+      release();
+      await backgroundRun;
+      assert.deepEqual(requests, [
+        { url: "https://provider-a.test/v1/images/generations", authorization: "Bearer key-a" },
+        { url: "https://provider-a.test/v1/responses", authorization: "Bearer key-a" },
+      ]);
+    } finally {
+      release(); client.dispose(); host.dispose(); ch.port1.close(); ch.port2.close();
+    }
+  });
+  }
+
+  it("refuses to delete a workspace whose lease is held by another tab", async () => {
+    const locks = new InMemoryLockProvider();
+    const backend = new InMemoryJournalBackend();
+    const blobs = new ContentAddressedBlobStore(new InMemoryBlobBackend());
+    const lease = await locks.acquireWorkspaceLease("ws-delete-a", "first-tab");
+    const store = new WorkspaceKernelStore(backend, blobs, lease, locks);
+    await store.initWorkspace("A");
+    const registry = new BrowserToolRegistry(store);
+    const inference: InferenceAdapter = { async *streamChat() {
+      yield { providerId: "test", model: "test", deltaText: "Done", toolCalls: [], usage: null, finishReason: "stop" };
+    } };
+    const runtime = new AgentKernelRuntime(store, inference, registry, registry.getToolDefinitions());
+    const ch = new MessageChannel();
+    const host = new KernelWorkerHost(store, runtime, ch.port1);
+    const client = new VelesAppClient(ch.port2);
+    let secondLease: Awaited<ReturnType<InMemoryLockProvider["acquireWorkspaceLease"]>> | undefined;
+    try {
+      await client.initWorkspace("A");
+      await client.switchWorkspace("ws-delete-b", "B");
+      secondLease = await locks.acquireWorkspaceLease("ws-delete-a", "second-tab");
+      assert.equal(secondLease.mode, "ReadWrite_Leader");
+      const owner = new WorkspaceKernelStore(backend, blobs, secondLease, locks);
+      await owner.writeWorkspaceFile("notes/owner.txt", "second-tab content");
+      await assert.rejects(client.deleteWorkspace("ws-delete-a"), /ERR_WORKSPACE_LOCKED_BY_OTHER_TAB/);
+      assert.equal(await owner.readFileText("notes/owner.txt"), "second-tab content");
+      assert.equal(client.getStateView().snapshot?.workspaceId, "ws-delete-b");
+      await secondLease.release();
+      const removed = await client.deleteWorkspace("ws-delete-a");
+      assert.equal(removed.workspaceId, "ws-delete-b");
+      assert.equal(await owner.getMetadata(), null);
+    } finally {
+      await secondLease?.release(); client.dispose(); host.dispose(); ch.port1.close(); ch.port2.close();
+    }
+  });
+
   it("preserves explicit restricted and unrestricted policies through the port and journal recovery", async () => {
     const locks = new InMemoryLockProvider();
     const lease = await locks.acquireWorkspaceLease("ws-explicit-policy", "policy-test");
@@ -726,8 +828,89 @@ describe("SYS-UI & SYS-KERNEL Worker MessagePort Bridge, Release Journey, & All 
       assert.equal(afterDelete.messages.length, 2);
       assert.equal(afterDelete.messages[0]?.runId, "run-chat2-2");
       assert.equal(afterDelete.messages[0]?.content, "Second turn in Chat 2");
-      // Workspace files are never touched when deleting a chat turn
+      // Workspace files are never touched when deleting a chat turn without revertFiles
       assert.equal(afterDelete.files["preview/index.html"], "<h1>Shared File</h1>");
+
+      // Verify deleteChatRun(..., { revertFiles: true }) restores files modified by a turn back to pre-turn SHA-256
+      await store.appendEvent({
+        eventId: "ev-revert-1",
+        runId: "run-file-edit",
+        type: "RunCreated",
+        nextState: "created",
+        payload: {
+          prompt: "Overwrite index.html and add temp.txt",
+          sessionId: "chat-2",
+          preRunFileTree: await store.getFileTree(),
+        },
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-2",
+        runId: "run-file-edit",
+        type: "RunPreparing",
+        nextState: "preparing",
+        payload: {},
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-3",
+        runId: "run-file-edit",
+        type: "CheckpointCommitted",
+        nextState: "inferring",
+        payload: {},
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-4",
+        runId: "run-file-edit",
+        type: "ToolIntentLogged",
+        nextState: "awaiting_tool",
+        relatedOperationId: "op-rev-1",
+        payload: {
+          toolCallId: "tc-rev-1",
+          toolName: "workspace.write_file",
+          args: { path: "preview/index.html", content: "<h1>Modified in turn</h1>" },
+        },
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-5",
+        runId: "run-file-edit",
+        type: "ToolDispatched",
+        nextState: "executing_tool",
+        relatedOperationId: "op-rev-1",
+        payload: { toolCallId: "tc-rev-1", toolName: "workspace.write_file" },
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-6",
+        runId: "run-file-edit",
+        type: "ToolResultCommitted",
+        nextState: "inferring",
+        relatedOperationId: "op-rev-1",
+        payload: {
+          toolCallId: "tc-rev-1",
+          toolName: "workspace.write_file",
+          outputText: "Updated",
+          observedFileHashes: {
+            "preview/index.html": await store.computeBlobHashForPreview("<h1>Modified in turn</h1>"),
+            "preview/new-temp.txt": await store.computeBlobHashForPreview("temp"),
+          },
+        },
+        fileUpdates: {
+          "preview/index.html": "<h1>Modified in turn</h1>",
+          "preview/new-temp.txt": "temp",
+        },
+      });
+      await store.appendEvent({
+        eventId: "ev-revert-7",
+        runId: "run-file-edit",
+        type: "RunCompleted",
+        nextState: "completed",
+        payload: { assistantText: "Modified files", sessionId: "chat-2" },
+      });
+      const beforeRevert = await client.refreshSnapshot();
+      assert.equal(beforeRevert.files["preview/index.html"], "<h1>Modified in turn</h1>");
+      assert.equal(beforeRevert.files["preview/new-temp.txt"], "temp");
+
+      const afterRevert = await client.deleteChatRun("run-file-edit", { revertFiles: true });
+      assert.equal(afterRevert.files["preview/index.html"], "<h1>Shared File</h1>");
+      assert.equal(afterRevert.files["preview/new-temp.txt"], undefined);
 
       // 6. Export and re-import bundle to verify tombstone record preserves monotonic seq
       const bundle = await client.exportWorkspace();
