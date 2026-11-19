@@ -60,6 +60,7 @@ export interface NormalizedStreamChunk {
   readonly providerId: string;
   readonly model: string;
   readonly deltaText: string;
+  readonly reasoningDeltaText?: string;
   readonly toolCalls: readonly ToolCallSpec[];
   readonly usage: TokenUsage | null;
   readonly finishReason: NormalizedFinishReason;
@@ -176,6 +177,16 @@ function mergeToolCallDeltas(
   }));
 }
 
+function extractReasoningDelta(delta: Record<string, unknown>): string {
+  if (typeof delta.reasoning_content === "string") {
+    return delta.reasoning_content;
+  }
+  if (typeof delta.reasoning === "string") {
+    return delta.reasoning;
+  }
+  return "";
+}
+
 function parseSseDataPayload(
   dataLine: string,
   config: ProviderModelConfig,
@@ -197,6 +208,7 @@ function parseSseDataPayload(
   const firstChoice = (choices[0] ?? {}) as Record<string, unknown>;
   const delta = (firstChoice.delta ?? {}) as Record<string, unknown>;
   const deltaText = typeof delta.content === "string" ? delta.content : "";
+  const reasoningDeltaText = extractReasoningDelta(delta);
   const toolCalls = mergeToolCallDeltas(
     toolAccumulators,
     delta.tool_calls,
@@ -209,6 +221,7 @@ function parseSseDataPayload(
     providerId: config.providerId,
     model: config.model,
     deltaText,
+    ...(reasoningDeltaText ? { reasoningDeltaText } : {}),
     toolCalls,
     usage,
     finishReason,

@@ -153,6 +153,7 @@ const STATIC_SYSTEM_CONTRACT_LINES = [
   "Workspace folders: `preview/` (live HTML/CSS/JS/SVG rendered in sandbox), `assets/` (images/media), `scripts/` (CLI/gateway scripts), `notes/` (plans/memory).",
   "Preview sandbox (`origin === \"null\"`): `localStorage`/`sessionStorage` and `alert()`/`confirm()`/`prompt()` modals are blocked; `window.veles` provides `kv.get(k)`, `kv.set(k, v)`, `kv.remove(k)`, `log(msg, detail?)`, and `sensors.latest` / `sensors.onUpdate(cb)`.",
   "kv.get(k) returns a value or null synchronously (do not use top-level await in classic <script> tags or call .then() on kv.get). Keep the real host bridge intact.",
+  "Keep any internal reasoning brief (<150 words; do not draft full file contents inside thinking) and emit tool calls (`workspace.write_file` / `workspace.edit_file` / `workspace.run_script`) directly.",
 ] as const;
 
 interface ContextMessageOrigin {
@@ -268,6 +269,30 @@ export class ContextBuilder {
     };
   }
 
+  private static normalizeContinuationUserMessage(
+    priorMessages: readonly ChatMessage[],
+    message: ChatMessage,
+  ): ChatMessage {
+    if (
+      message.role !== "user" ||
+      !ContextBuilder.isFollowUpContinuationPrompt(message.content)
+    ) {
+      return message;
+    }
+    const prev = priorMessages.at(-1);
+    const afterTruncated =
+      prev?.role === "assistant" &&
+      !prev.toolCalls?.length &&
+      (prev.content.trim() === "" ||
+        prev.content.startsWith("[Reasoning truncated before tool call"));
+    return afterTruncated
+      ? {
+          ...message,
+          content: `${message.content} (Your previous turn ran out of tokens during internal reasoning before emitting any tool call. Skip extended thinking and emit the required tool calls immediately.)`,
+        }
+      : message;
+  }
+
   private static appendTrackedRecord(
     compiled: CompiledContext,
     rec: RunJournalRecord,
@@ -291,7 +316,11 @@ export class ContextBuilder {
         ContextBuilder.totalMessageChars(unfolded) - ContextBuilder.totalMessageChars(emitted),
       );
     }
-    for (const message of emitted) {
+    for (const rawMessage of emitted) {
+      const message = ContextBuilder.normalizeContinuationUserMessage(
+        compiled.messages,
+        rawMessage,
+      );
       compiled.origins.set(message, {
         runId: rec.runId, foldedSavedChars: savedChars,
       });
@@ -1009,6 +1038,41 @@ export class ContextBuilder {
           "TOOL_CALL_INTERRUPTED: Tool execution was stopped or interrupted before completion.",
       });
     }
+  }
+
+  public static isFollowUpContinuationPrompt(text: string): boolean {
+    return /^(?:continue|keep going|go on|resume|retry|try again|proceed|finish)[.!\s]*$/i.test(
+      text.trim(),
+    );
+  }
+
+  public static resolveRoutingPrompt(
+    journal: readonly RunJournalRecord[],
+    runId: RunId,
+    sessionId?: string,
+  ): string {
+    const createdRec = [...journal]
+      .reverse()
+      .find((r) => r.runId === runId && r.type === "RunCreated");
+    const currentPrompt = String(createdRec?.payload.prompt ?? "");
+    if (!ContextBuilder.isFollowUpContinuationPrompt(currentPrompt)) {
+      return currentPrompt;
+    }
+    const targetSession = sessionId ?? "session-main";
+    const priorSubstantive = [...journal]
+      .reverse()
+      .find(
+        (r) =>
+          r.runId !== runId &&
+          r.type === "RunCreated" &&
+          ContextBuilder.doesRunMatchSession(r, targetSession) &&
+          !ContextBuilder.isFollowUpContinuationPrompt(
+            String(r.payload.prompt ?? ""),
+          ),
+      );
+    return priorSubstantive
+      ? `${String(priorSubstantive.payload.prompt ?? "")}\n${currentPrompt}`
+      : currentPrompt;
   }
 }
 
@@ -1771,15 +1835,15 @@ export class AgentKernelRuntime {
     const journal = await this.store.getJournal();
     if (resolvedOpts.sessionId !== undefined || this.options.multiTurnWorkspaceContext) {
       const fileTree = await this.store.getFileTree();
-      const latestPrompt =
-        [...journal]
-          .reverse()
-          .find((r) => r.runId === runId && r.type === "RunCreated")?.payload
-          .prompt ?? "";
+      const routingPrompt = ContextBuilder.resolveRoutingPrompt(
+        journal,
+        runId,
+        resolvedOpts.sessionId,
+      );
       const configuredMode = this.serviceConfig.decision.mode;
       const { result: routed, cacheHit, attemptCount } = await this.resolveRoundRouting(
         runId,
-        String(latestPrompt),
+        routingPrompt,
         Object.keys(fileTree),
         configuredMode,
         signal,
@@ -2013,6 +2077,32 @@ export class AgentKernelRuntime {
     });
   }
 
+  private emitStreamChunkDeltas(
+    runId: RunId,
+    chunk: { readonly deltaText: string; readonly reasoningDeltaText?: string },
+    hadReasoning: boolean,
+    hadContent: boolean,
+  ): void {
+    if (chunk.reasoningDeltaText) {
+      const prefix = hadReasoning ? "" : "💭 Thinking...\n";
+      this.emit({
+        type: "STREAM_DELTA",
+        runId,
+        state: "inferring",
+        detail: { deltaText: `${prefix}${chunk.reasoningDeltaText}` },
+      });
+    }
+    if (chunk.deltaText) {
+      const sep = hadReasoning && !hadContent ? "\n\n---\n\n" : "";
+      this.emit({
+        type: "STREAM_DELTA",
+        runId,
+        state: "inferring",
+        detail: { deltaText: `${sep}${chunk.deltaText}` },
+      });
+    }
+  }
+
   private async consumeInferenceStream(
     runId: RunId,
     config: ProviderModelConfig,
@@ -2025,6 +2115,7 @@ export class AgentKernelRuntime {
     usage: TokenUsage | null;
   }> {
     let assistantText = "";
+    let reasoningText = "";
     let latestToolCalls: ToolCallSpec[] = [];
     let latestUsage: TokenUsage | null = null;
     const availableTools = allowedTools
@@ -2045,26 +2136,31 @@ export class AgentKernelRuntime {
         signal.throwIfAborted();
         if (next.done) break;
         const chunk = next.value;
-        if (chunk.deltaText) {
-          assistantText += chunk.deltaText;
-          this.emit({
-            type: "STREAM_DELTA",
-            runId,
-            state: "inferring",
-            detail: { deltaText: chunk.deltaText },
-          });
-        }
-        if (chunk.toolCalls.length > 0) {
-          latestToolCalls = [...chunk.toolCalls];
-        }
-        if (chunk.usage) {
-          latestUsage = chunk.usage;
-        }
+        this.emitStreamChunkDeltas(
+          runId,
+          chunk,
+          reasoningText.length > 0,
+          assistantText.length > 0,
+        );
+        if (chunk.reasoningDeltaText) reasoningText += chunk.reasoningDeltaText;
+        if (chunk.deltaText) assistantText += chunk.deltaText;
+        if (chunk.toolCalls.length > 0) latestToolCalls = [...chunk.toolCalls];
+        if (chunk.usage) latestUsage = chunk.usage;
       }
     } finally {
       if (signal.aborted) void iterator.return?.().catch(() => {});
     }
-    return { assistantText, toolCalls: latestToolCalls, usage: latestUsage };
+    const resolvedAssistantText =
+      assistantText.trim().length > 0 ||
+      latestToolCalls.length > 0 ||
+      reasoningText.trim().length === 0
+        ? assistantText
+        : `[Reasoning truncated before tool call (${reasoningText.length} chars) — emit workspace.write_file / workspace.edit_file directly without repeating reasoning]\n${reasoningText.trim().slice(-1200)}`;
+    return {
+      assistantText: resolvedAssistantText,
+      toolCalls: latestToolCalls,
+      usage: latestUsage,
+    };
   }
 
   private async processToolCall(
